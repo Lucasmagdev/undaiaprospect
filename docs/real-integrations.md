@@ -1,6 +1,6 @@
-# Integrações Reais
+# Integracoes Reais
 
-Este projeto ainda usa dados mockados em boa parte do frontend, mas a base para integrações reais fica no backend.
+O backend concentra as chaves sensiveis e expoe uma camada local para o frontend. As abas de campanhas, leads, templates, inbox e instancias ja consultam rotas reais quando a API esta rodando.
 
 ## Supabase
 
@@ -41,7 +41,21 @@ Resposta esperada:
 }
 ```
 
-Se o schema ainda não tiver sido aplicado, o endpoint deve retornar erro informando que a tabela não existe.
+## Rotas Reais Ativas
+
+```text
+GET  /api/db/health
+GET  /api/campaigns
+POST /api/campaigns
+GET  /api/leads
+POST /api/leads
+GET  /api/templates
+POST /api/templates
+GET  /api/inbox/conversations
+POST /api/inbox/conversations/:phone/send
+POST /api/webhooks/evolution
+GET  /api/whatsapp/messages
+```
 
 ## Evolution API
 
@@ -51,12 +65,20 @@ A Evolution continua acessada apenas pelo backend proxy. O frontend chama rotas 
 /api/whatsapp/instances
 /api/whatsapp/instances/:instanceName/connect
 /api/whatsapp/instances/:instanceName/state
+/api/whatsapp/instances/:instanceName/send-text
 ```
 
-## Próximos Passos
+Para receber respostas automaticamente, configure o webhook da Evolution apontando para:
 
-- Persistir instâncias da Evolution em `whatsapp_instances`.
-- Registrar mensagens enviadas/recebidas em `messages`.
-- Trocar a aba Leads para consultar `leads`.
-- Trocar campanhas mockadas por `campaigns`.
-- Criar webhook da Evolution para gravar respostas recebidas.
+```text
+https://api.seudominio.com/api/webhooks/evolution
+```
+
+No desenvolvimento local, use um tunel HTTPS quando precisar testar webhooks externos.
+
+## Ainda Mockado Ou Parcial
+
+- Banco por nicho e sequencias de automacao ainda ficam em memoria no frontend.
+- Google Places ainda nao esta integrado.
+- A fila real com delay 30-60s, limite diario e retomada de campanha ainda precisa de worker.
+- Autenticacao de usuarios/SaaS ainda nao foi adicionada.

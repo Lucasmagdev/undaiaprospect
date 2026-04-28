@@ -63,7 +63,7 @@ export async function setup(root) {
     btn.addEventListener('click', () => {
       list.querySelectorAll('.conversation').forEach(b => b.classList.remove('active'))
       btn.classList.add('active')
-      activeConvId = parseInt(btn.dataset.id)
+      activeConvId = btn.dataset.id
       const conv = conversations.find(c => c.id === activeConvId)
       renderChat(root, conv, conversations)
     })

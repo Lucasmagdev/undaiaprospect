@@ -134,17 +134,59 @@ let _sequences = [
 
 /* ── CAMPAIGN SERVICE ── */
 
+function compactDate(value) {
+  if (!value) return '—'
+  return new Date(value).toLocaleString('pt-BR', { day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' })
+}
+
+function campaignStatus(status) {
+  return {
+    draft: 'Pausada',
+    running: 'Rodando',
+    paused: 'Pausada',
+    finished: 'Finalizada',
+    error: 'Erro',
+  }[status] || status
+}
+
+function templateUse(purpose) {
+  return {
+    initial: 'Mensagem inicial',
+    follow_up: 'Sem resposta',
+    manual_reply: 'Lead respondeu',
+    proposal: 'Proposta',
+    other: 'Outro',
+  }[purpose] || purpose
+}
 export const CampaignService = {
   async list() {
-    await delay(300)
-    return [..._campaigns]
+    const campaigns = await apiFetch('/api/campaigns')
+    return campaigns.map(c => ({
+      id: c.id,
+      name: c.name,
+      niche: c.niche,
+      city: c.city,
+      status: campaignStatus(c.status),
+      progress: c.status === 'finished' ? 100 : c.status === 'running' ? 35 : 0,
+      found: c.quantity_requested || 0,
+      sent: 0,
+      replies: 0,
+    }))
   },
 
   async create(data) {
-    await delay(600)
-    const c = { ...data, id: Date.now(), progress: 0, found: 0, sent: 0, replies: 0, status: 'Pausada' }
-    _campaigns.unshift(c)
-    return c
+    const campaign = await apiFetch('/api/campaigns', {
+      method: 'POST',
+      body: JSON.stringify(data),
+    })
+    return {
+      ...campaign,
+      status: campaignStatus(campaign.status),
+      progress: 0,
+      found: campaign.quantity_requested || 0,
+      sent: 0,
+      replies: 0,
+    }
   },
 
   async setStatus(id, status) {
@@ -154,52 +196,49 @@ export const CampaignService = {
     return c
   },
 }
-
 /* ── LEAD SERVICE ── */
 
 export const LeadService = {
   async list(filters = {}) {
-    await delay(350)
-    let result = [..._leads]
-    if (filters.hasWebsite === true)  result = result.filter(l => l.website !== 'sem site')
-    if (filters.hasWebsite === false) result = result.filter(l => l.website === 'sem site')
-    if (filters.search) {
-      const q = filters.search.toLowerCase()
-      result = result.filter(l =>
-        l.name.toLowerCase().includes(q) ||
-        l.niche.toLowerCase().includes(q) ||
-        l.city.toLowerCase().includes(q)
-      )
+    const params = new URLSearchParams()
+    if (filters.search) params.set('search', filters.search)
+    if (filters.hasWebsite !== null && filters.hasWebsite !== undefined) {
+      params.set('hasWebsite', String(filters.hasWebsite))
     }
-    return result
+    const leads = await apiFetch(`/api/leads${params.toString() ? `?${params}` : ''}`)
+    return leads.map(l => ({
+      id: l.id,
+      name: l.name,
+      phone: l.phone || l.normalized_phone || '—',
+      city: l.city || '—',
+      niche: l.niche || '—',
+      website: l.website || 'sem site',
+      status: l.status || 'new',
+      last: compactDate(l.last_interaction_at || l.created_at),
+    }))
   },
 
   async exportCSV() {
-    await delay(200)
-    const headers = ['Empresa', 'Telefone', 'Cidade', 'Nicho', 'Website', 'Status', 'Última interação']
-    const rows = _leads.map(l => [l.name, l.phone, l.city, l.niche, l.website, l.status, l.last])
+    const leads = await this.list({})
+    const headers = ['Empresa', 'Telefone', 'Cidade', 'Nicho', 'Website', 'Status', 'Ultima interacao']
+    const rows = leads.map(l => [l.name, l.phone, l.city, l.niche, l.website, l.status, l.last])
     return [headers, ...rows].map(r => r.map(v => `"${v}"`).join(',')).join('\n')
   },
 }
-
 /* ── CONVERSATION SERVICE ── */
 
 export const ConversationService = {
   async list() {
-    await delay(200)
-    return _conversations.map(c => ({ ...c, messages: [...c.messages] }))
+    return apiFetch('/api/inbox/conversations')
   },
 
   async send(conversationId, text) {
-    await delay(300)
-    const conv = _conversations.find(c => c.id === conversationId)
-    if (!conv) throw new Error('Conversa não encontrada')
-    const msg = { dir: 'out', text, time: new Date().toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' }) }
-    conv.messages.push(msg)
-    return msg
+    return apiFetch(`/api/inbox/conversations/${encodeURIComponent(conversationId)}/send`, {
+      method: 'POST',
+      body: JSON.stringify({ text }),
+    })
   },
 }
-
 /* ── TEMPLATE SERVICE ── */
 
 function resolveTemplateBody(id) {
@@ -216,15 +255,28 @@ function resolveTemplateBody(id) {
 
 export const TemplateService = {
   async list() {
-    await delay(250)
-    return [..._templates]
+    const templates = await apiFetch('/api/templates')
+    return templates.map(t => ({
+      id: t.id,
+      name: t.name,
+      use: templateUse(t.purpose),
+      conversion: '—',
+      body: t.body,
+    }))
   },
 
   async create(data) {
-    await delay(500)
-    const t = { ...data, id: Date.now() }
-    _templates.push(t)
-    return t
+    const template = await apiFetch('/api/templates', {
+      method: 'POST',
+      body: JSON.stringify(data),
+    })
+    return {
+      id: template.id,
+      name: template.name,
+      use: templateUse(template.purpose),
+      conversion: '—',
+      body: template.body,
+    }
   },
 
   async listNicheBank() {
@@ -257,7 +309,7 @@ export const TemplateService = {
   async updateSequenceStep(seqId, stepIndex, templateId) {
     await delay(150)
     const seq = _sequences.find(s => s.id === seqId)
-    if (!seq || !seq.steps[stepIndex]) throw new Error('Sequência ou etapa não encontrada')
+    if (!seq || !seq.steps[stepIndex]) throw new Error('Sequencia ou etapa nao encontrada')
     seq.steps[stepIndex].templateId = templateId
     seq.steps[stepIndex].preview = resolveTemplateBody(templateId)
     return { ...seq, steps: seq.steps.map(st => ({ ...st })) }
@@ -265,7 +317,6 @@ export const TemplateService = {
 
   resolveBody: resolveTemplateBody,
 }
-
 /* ── SETTINGS SERVICE ── */
 
 let _settings = {

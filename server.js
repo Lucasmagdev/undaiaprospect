@@ -119,19 +119,29 @@ function normalizePhone(value) {
   return String(value || '').replace(/[\s+\-().]/g, '')
 }
 
+function sanitizeLike(value) {
+  return String(value || '').replace(/[%*,]/g, '').trim()
+}
+
+function formatSupabaseDate(value) {
+  if (!value) return null
+  return new Date(value).toISOString()
+}
+
 function instanceRecord(instance, overrides = {}) {
   const name = instance?.name || instance?.instanceName || instance?.instance?.instanceName || overrides.evolution_instance_name
-  return {
+  const record = {
     evolution_instance_name: name,
     evolution_instance_id: instance?.id || instance?.instanceId || instance?.instance?.instanceId || overrides.evolution_instance_id || null,
     display_name: instance?.profileName || instance?.displayName || overrides.display_name || null,
     phone: normalizePhone(instance?.number || instance?.ownerJid || overrides.phone || '').replace(/@.*/, '') || null,
     status: instance?.connectionStatus || instance?.status || instance?.instance?.status || overrides.status || 'created',
     integration: instance?.integration || instance?.instance?.integration || overrides.integration || 'WHATSAPP-BAILEYS',
-    last_connected_at: (instance?.connectionStatus === 'open' || overrides.status === 'open') ? new Date().toISOString() : null,
     last_seen_at: new Date().toISOString(),
     settings: instance?.Setting || instance?.settings || overrides.settings || {},
   }
+  if (record.status === 'open') record.last_connected_at = new Date().toISOString()
+  return record
 }
 
 async function upsertWhatsappInstance(instance, overrides = {}) {
@@ -166,6 +176,64 @@ async function incrementInstanceSentToday(instanceId, currentValue = 0) {
     method: 'PATCH',
     body: JSON.stringify({ sent_today: Number(currentValue || 0) + 1, last_seen_at: new Date().toISOString() }),
   })
+}
+
+async function findLeadByPhone(phone) {
+  const normalized = normalizePhone(phone)
+  if (!normalized) return null
+  const result = await supabaseRequest(`/leads?normalized_phone=eq.${encodeURIComponent(normalized)}&select=id,name,normalized_phone,status&limit=1`)
+  return result.ok && Array.isArray(result.data) ? result.data[0] : null
+}
+
+async function findDefaultOpenInstance() {
+  const result = await supabaseRequest('/whatsapp_instances?status=eq.open&select=id,evolution_instance_name,sent_today&order=last_seen_at.desc&limit=1')
+  return result.ok && Array.isArray(result.data) ? result.data[0] : null
+}
+
+async function saveInboundMessage(payload) {
+  const instanceName =
+    payload?.instance ||
+    payload?.instanceName ||
+    payload?.instance?.instanceName ||
+    payload?.data?.instanceName ||
+    null
+
+  const message = payload?.data?.message || payload?.message || payload?.data || payload
+  const key = payload?.data?.key || message?.key || {}
+  const remoteJid = key?.remoteJid || payload?.data?.remoteJid || message?.remoteJid || ''
+  const phone = normalizePhone(payload?.phone || payload?.data?.number || remoteJid.replace(/@.*/, ''))
+  const body =
+    message?.conversation ||
+    message?.extendedTextMessage?.text ||
+    payload?.data?.text ||
+    payload?.text ||
+    ''
+
+  if (!phone || !body) return null
+
+  const lead = await findLeadByPhone(phone)
+  const instance = instanceName ? await findWhatsappInstance(instanceName) : null
+  const saved = await insertMessage({
+    lead_id: lead?.id || null,
+    whatsapp_instance_id: instance?.id || null,
+    direction: 'inbound',
+    kind: 'text',
+    phone,
+    body,
+    provider_message_id: key?.id || payload?.id || null,
+    status: 'received',
+    raw_payload: payload,
+    received_at: new Date().toISOString(),
+  })
+
+  if (lead?.id) {
+    await supabaseRequest(`/leads?id=eq.${encodeURIComponent(lead.id)}`, {
+      method: 'PATCH',
+      body: JSON.stringify({ status: 'responded', last_interaction_at: new Date().toISOString() }),
+    })
+  }
+
+  return saved
 }
 
 function normalizeQrCode(data) {
@@ -212,6 +280,184 @@ async function handleApi(req, res, url) {
       table: 'whatsapp_instances',
       rowsChecked: Array.isArray(result.data) ? result.data.length : 0,
     })
+  }
+
+  if (url.pathname === '/api/campaigns' && req.method === 'GET') {
+    const result = await supabaseRequest('/campaigns?select=id,name,niche,city,status,quantity_requested,daily_limit,started_at,finished_at,created_at&order=created_at.desc')
+    return sendJson(res, result.status, result.data)
+  }
+
+  if (url.pathname === '/api/campaigns' && req.method === 'POST') {
+    const body = await readBody(req)
+    if (!body.name || !body.niche || !body.city) {
+      return sendJson(res, 400, { message: 'name, niche e city sao obrigatorios.' })
+    }
+    const result = await supabaseRequest('/campaigns', {
+      method: 'POST',
+      body: JSON.stringify({
+        name: body.name,
+        niche: body.niche,
+        city: body.city,
+        quantity_requested: Number(body.quantity_requested || body.quantity || 0),
+        status: body.status || 'draft',
+      }),
+    })
+    return sendJson(res, result.status, result.data?.[0] || result.data)
+  }
+
+  if (url.pathname === '/api/leads' && req.method === 'GET') {
+    const search = sanitizeLike(url.searchParams.get('search'))
+    const hasWebsite = url.searchParams.get('hasWebsite')
+    const params = [
+      'select=id,name,phone,normalized_phone,niche,city,address,website,status,last_interaction_at,created_at',
+      'order=created_at.desc',
+      'limit=200',
+    ]
+    if (search) params.push(`or=(name.ilike.*${encodeURIComponent(search)}*,niche.ilike.*${encodeURIComponent(search)}*,city.ilike.*${encodeURIComponent(search)}*)`)
+    if (hasWebsite === 'true') params.push('website=not.is.null')
+    if (hasWebsite === 'false') params.push('website=is.null')
+    const result = await supabaseRequest(`/leads?${params.join('&')}`)
+    return sendJson(res, result.status, result.data)
+  }
+
+  if (url.pathname === '/api/leads' && req.method === 'POST') {
+    const body = await readBody(req)
+    if (!body.name) return sendJson(res, 400, { message: 'name obrigatorio.' })
+    const phone = normalizePhone(body.phone)
+    const result = await supabaseRequest('/leads', {
+      method: 'POST',
+      body: JSON.stringify({
+        name: body.name,
+        phone: body.phone || null,
+        normalized_phone: phone || null,
+        niche: body.niche || null,
+        city: body.city || null,
+        address: body.address || null,
+        website: body.website || null,
+        source: body.source || 'manual',
+        status: body.status || 'new',
+      }),
+    })
+    return sendJson(res, result.status, result.data?.[0] || result.data)
+  }
+
+  if (url.pathname === '/api/templates' && req.method === 'GET') {
+    const result = await supabaseRequest('/message_templates?select=id,name,purpose,body,variables,is_active,created_at&is_active=eq.true&order=created_at.desc')
+    return sendJson(res, result.status, result.data)
+  }
+
+  if (url.pathname === '/api/templates' && req.method === 'POST') {
+    const body = await readBody(req)
+    if (!body.name || !body.body) return sendJson(res, 400, { message: 'name e body sao obrigatorios.' })
+    const purposeMap = {
+      'Mensagem inicial': 'initial',
+      'Sem resposta': 'follow_up',
+      'Lead respondeu': 'manual_reply',
+    }
+    const result = await supabaseRequest('/message_templates', {
+      method: 'POST',
+      body: JSON.stringify({
+        name: body.name,
+        purpose: body.purpose || purposeMap[body.use] || 'other',
+        body: body.body,
+        variables: body.variables || [],
+        is_active: true,
+      }),
+    })
+    return sendJson(res, result.status, result.data?.[0] || result.data)
+  }
+
+  if (url.pathname === '/api/inbox/conversations' && req.method === 'GET') {
+    const result = await supabaseRequest('/messages?select=id,lead_id,direction,phone,body,status,sent_at,received_at,created_at,leads(name,status)&order=created_at.asc&limit=500')
+    if (!result.ok) return sendJson(res, result.status, result.data)
+
+    const grouped = new Map()
+    for (const message of result.data || []) {
+      const phone = message.phone || 'sem-telefone'
+      if (!grouped.has(phone)) {
+        grouped.set(phone, {
+          id: phone,
+          phone,
+          lead: message.leads?.name || phone,
+          mood: message.leads?.status === 'responded' ? 'Quente' : message.direction === 'inbound' ? 'Respondeu' : 'Aguardando',
+          time: '',
+          messages: [],
+        })
+      }
+      const conv = grouped.get(phone)
+      const date = message.received_at || message.sent_at || message.created_at
+      conv.time = date ? new Date(date).toLocaleString('pt-BR', { day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' }) : ''
+      conv.messages.push({
+        id: message.id,
+        dir: message.direction === 'outbound' ? 'out' : 'in',
+        text: message.body || '',
+        status: message.status,
+        time: date ? new Date(date).toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' }) : '',
+      })
+    }
+    return sendJson(res, 200, Array.from(grouped.values()).sort((a, b) => String(b.time).localeCompare(String(a.time))))
+  }
+
+  const inboxSendMatch = url.pathname.match(/^\/api\/inbox\/conversations\/([^/]+)\/send$/)
+  if (inboxSendMatch && req.method === 'POST') {
+    const phone = normalizePhone(decodeURIComponent(inboxSendMatch[1]))
+    const body = await readBody(req)
+    if (!phone) return sendJson(res, 400, { message: 'Telefone obrigatorio.' })
+    if (!body.text) return sendJson(res, 400, { message: 'text obrigatorio.' })
+
+    const instance = body.instanceName
+      ? await findWhatsappInstance(body.instanceName)
+      : await findDefaultOpenInstance()
+    if (!instance?.evolution_instance_name) {
+      return sendJson(res, 409, { message: 'Nenhuma instancia WhatsApp aberta encontrada.' })
+    }
+
+    const lead = await findLeadByPhone(phone)
+    const pendingMessage = await insertMessage({
+      lead_id: lead?.id || null,
+      whatsapp_instance_id: instance.id,
+      direction: 'outbound',
+      kind: 'text',
+      phone,
+      body: body.text,
+      status: 'pending',
+      raw_payload: { instanceName: instance.evolution_instance_name, source: 'inbox' },
+    })
+
+    const result = await evolutionRequest(`/message/sendText/${encodeURIComponent(instance.evolution_instance_name)}`, {
+      method: 'POST',
+      body: JSON.stringify({ number: phone, text: body.text }),
+    })
+
+    if (pendingMessage?.id) {
+      await supabaseRequest(`/messages?id=eq.${encodeURIComponent(pendingMessage.id)}`, {
+        method: 'PATCH',
+        body: JSON.stringify({
+          status: result.ok ? 'sent' : 'failed',
+          provider_message_id: result.data?.key?.id || result.data?.message?.key?.id || result.data?.id || null,
+          error_message: result.ok ? null : result.data?.message || result.data?.error || 'Falha no envio',
+          raw_payload: result.data || {},
+          sent_at: result.ok ? new Date().toISOString() : null,
+        }),
+      })
+    }
+    if (result.ok) await incrementInstanceSentToday(instance.id, instance.sent_today)
+    if (!result.ok) return sendJson(res, result.status, result.data)
+
+    return sendJson(res, 200, {
+      dir: 'out',
+      text: body.text,
+      time: new Date().toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' }),
+    })
+  }
+
+  if (url.pathname === '/api/webhooks/evolution' && req.method === 'POST') {
+    const body = await readBody(req)
+    const event = body?.event || body?.type || ''
+    if (event.includes('messages') || event.includes('MESSAGES') || body?.data?.message || body?.message) {
+      await saveInboundMessage(body)
+    }
+    return sendJson(res, 200, { ok: true })
   }
 
   if (url.pathname === '/api/whatsapp/instances' && req.method === 'GET') {
@@ -332,25 +578,29 @@ async function handleApi(req, res, url) {
       null
 
     if (result.ok) {
-      await supabaseRequest(`/messages?id=eq.${encodeURIComponent(pendingMessage?.id || '')}`, {
-        method: 'PATCH',
-        body: JSON.stringify({
-          status: 'sent',
-          provider_message_id: providerMessageId,
-          raw_payload: result.data || {},
-          sent_at: new Date().toISOString(),
-        }),
-      })
+      if (pendingMessage?.id) {
+        await supabaseRequest(`/messages?id=eq.${encodeURIComponent(pendingMessage.id)}`, {
+          method: 'PATCH',
+          body: JSON.stringify({
+            status: 'sent',
+            provider_message_id: providerMessageId,
+            raw_payload: result.data || {},
+            sent_at: new Date().toISOString(),
+          }),
+        })
+      }
       await incrementInstanceSentToday(instanceRecord?.id, instanceRecord?.sent_today)
     } else {
-      await supabaseRequest(`/messages?id=eq.${encodeURIComponent(pendingMessage?.id || '')}`, {
-        method: 'PATCH',
-        body: JSON.stringify({
-          status: 'failed',
-          error_message: result.data?.message || result.data?.error || 'Falha no envio',
-          raw_payload: result.data || {},
-        }),
-      })
+      if (pendingMessage?.id) {
+        await supabaseRequest(`/messages?id=eq.${encodeURIComponent(pendingMessage.id)}`, {
+          method: 'PATCH',
+          body: JSON.stringify({
+            status: 'failed',
+            error_message: result.data?.message || result.data?.error || 'Falha no envio',
+            raw_payload: result.data || {},
+          }),
+        })
+      }
     }
 
     return sendJson(res, result.status, result.data)
