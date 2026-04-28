@@ -189,11 +189,12 @@ export const CampaignService = {
     }
   },
 
-  async setStatus(id, status) {
-    await delay(200)
-    const c = _campaigns.find(c => c.id === id)
-    if (c) c.status = status
-    return c
+  async run(id) {
+    return apiFetch(`/api/campaigns/${id}/run`, { method: 'POST' })
+  },
+
+  async status(id) {
+    return apiFetch(`/api/campaigns/${id}/status`)
   },
 }
 /* ── LEAD SERVICE ── */
@@ -216,6 +217,18 @@ export const LeadService = {
       status: l.status || 'new',
       last: compactDate(l.last_interaction_at || l.created_at),
     }))
+  },
+
+  async discover(niche, city, limit = 30) {
+    const params = new URLSearchParams({ niche, city, limit: String(limit) })
+    return apiFetch(`/api/search/leads?${params}`)
+  },
+
+  async create(lead) {
+    return apiFetch('/api/leads', {
+      method: 'POST',
+      body: JSON.stringify(lead),
+    })
   },
 
   async exportCSV() {

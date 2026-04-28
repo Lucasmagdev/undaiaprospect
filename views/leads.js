@@ -1,8 +1,44 @@
-import { leadStatus, skeletonTable, emptyState } from '../components.js'
+import { leadStatus, skeletonTable, emptyState, skeletonCards } from '../components.js'
 import { toast } from '../toast.js'
 import { LeadService } from '../services.js'
 
 let filters = { hasWebsite: null, search: '' }
+let discoveryResults = []
+
+const NICHES = [
+  { value: 'restaurante', label: 'Restaurante' },
+  { value: 'odontologia', label: 'Odontologia' },
+  { value: 'academia',    label: 'Academia' },
+  { value: 'advocacia',   label: 'Advocacia' },
+  { value: 'contabilidade', label: 'Contabilidade' },
+  { value: 'estetica',    label: 'Clínica Estética' },
+  { value: 'imobiliaria', label: 'Imobiliária' },
+]
+
+function renderDiscoveryResults() {
+  if (!discoveryResults.length) return ''
+  return `
+    <div class="discovery-results">
+      <div class="discovery-results-head">
+        <strong>${discoveryResults.length} leads encontrados</strong>
+        <button class="primary import-all-btn" type="button">Importar todos</button>
+      </div>
+      <div class="discovery-cards">
+        ${discoveryResults.map((lead, i) => `
+          <div class="discovery-card" data-idx="${i}">
+            <div class="discovery-card-head">
+              <strong>${lead.name}</strong>
+              ${lead.phone ? `<span class="discovery-phone">${lead.phone}</span>` : '<span class="muted">sem telefone</span>'}
+            </div>
+            ${lead.address ? `<p class="discovery-addr">${lead.address}</p>` : ''}
+            ${lead.website ? `<a href="${lead.website}" target="_blank" rel="noopener" class="discovery-site">${lead.website}</a>` : ''}
+            <button class="secondary import-one-btn" type="button" data-idx="${i}">Importar</button>
+          </div>
+        `).join('')}
+      </div>
+    </div>
+  `
+}
 
 export function render() {
   return `
@@ -12,6 +48,28 @@ export function render() {
         <h1>Leads</h1>
       </div>
     </section>
+
+    <article class="panel prospect-panel">
+      <div class="panel-head">
+        <h2>Prospectar leads</h2>
+        <span class="badge-neutral">Overpass / OSM</span>
+      </div>
+      <form class="prospect-form" autocomplete="off">
+        <label>Nicho
+          <select name="niche">
+            ${NICHES.map(n => `<option value="${n.value}">${n.label}</option>`).join('')}
+          </select>
+        </label>
+        <label>Cidade
+          <input name="city" value="Belo Horizonte" placeholder="Ex: São Paulo" />
+        </label>
+        <label>Limite
+          <input name="limit" type="number" value="30" min="5" max="100" />
+        </label>
+        <button class="primary prospect-btn" type="submit">Buscar leads</button>
+      </form>
+      <div class="prospect-results"></div>
+    </article>
 
     <div class="table-toolbar">
       <div class="search-wrap">
@@ -35,11 +93,79 @@ export function render() {
   `
 }
 
-export async function setup(root) {
-  // Reset filters on each mount
-  filters = { hasWebsite: null, search: '' }
+async function importLead(lead, root) {
+  try {
+    await LeadService.create({
+      name: lead.name,
+      phone: lead.phone || null,
+      address: lead.address || null,
+      website: lead.website || null,
+      niche: lead.niche,
+      city: lead.city,
+      source: 'overpass',
+      status: 'new',
+    })
+    toast(`${lead.name} importado.`, 'success')
+    await loadTable(root)
+  } catch (err) {
+    toast(err.message, 'error')
+  }
+}
 
-  // Search — debounced
+async function importAll(root) {
+  const btn = root.querySelector('.import-all-btn')
+  if (btn) { btn.disabled = true; btn.textContent = 'Importando...' }
+  let ok = 0
+  for (const lead of discoveryResults) {
+    try {
+      await LeadService.create({
+        name: lead.name,
+        phone: lead.phone || null,
+        address: lead.address || null,
+        website: lead.website || null,
+        niche: lead.niche,
+        city: lead.city,
+        source: 'overpass',
+        status: 'new',
+      })
+      ok++
+    } catch { /* skip duplicates */ }
+  }
+  toast(`${ok} leads importados.`, 'success')
+  discoveryResults = []
+  root.querySelector('.prospect-results').innerHTML = ''
+  await loadTable(root)
+}
+
+export async function setup(root) {
+  filters = { hasWebsite: null, search: '' }
+  discoveryResults = []
+
+  root.querySelector('.prospect-form').addEventListener('submit', async event => {
+    event.preventDefault()
+    const btn = root.querySelector('.prospect-btn')
+    const data = new FormData(event.currentTarget)
+    const niche = data.get('niche')
+    const city = String(data.get('city') || '').trim()
+    const limit = Number(data.get('limit') || 30)
+    if (!city) { toast('Informe a cidade.', 'warning'); return }
+    btn.disabled = true
+    btn.textContent = 'Buscando...'
+    root.querySelector('.prospect-results').innerHTML = `<div class="skeleton-wrap">${skeletonCards(3)}</div>`
+    try {
+      discoveryResults = await LeadService.discover(niche, city, limit)
+      root.querySelector('.prospect-results').innerHTML = renderDiscoveryResults()
+      bindDiscoveryActions(root)
+      if (!discoveryResults.length) toast('Nenhum lead encontrado para esse nicho/cidade.', 'warning')
+    } catch (err) {
+      root.querySelector('.prospect-results').innerHTML = ''
+      toast(err.message, 'error')
+    } finally {
+      btn.disabled = false
+      btn.textContent = 'Buscar leads'
+    }
+  })
+
   let debounce = null
   root.querySelector('#lead-search').addEventListener('input', e => {
     clearTimeout(debounce)
@@ -47,7 +173,6 @@ export async function setup(root) {
     debounce = setTimeout(() => loadTable(root), 280)
   })
 
-  // Filter buttons
   root.querySelectorAll('.filter-btn').forEach(btn => {
     btn.addEventListener('click', () => {
       root.querySelectorAll('.filter-btn').forEach(b => b.classList.remove('active'))
@@ -59,7 +184,6 @@ export async function setup(root) {
   })
   root.querySelector('[data-filter="all"]').classList.add('active')
 
-  // Export
   root.querySelector('#export-btn').addEventListener('click', async () => {
     const btn = root.querySelector('#export-btn')
     btn.disabled = true
@@ -81,6 +205,22 @@ export async function setup(root) {
   })
 
   await loadTable(root)
+}
+
+function bindDiscoveryActions(root) {
+  root.querySelector('.import-all-btn')?.addEventListener('click', () => importAll(root))
+
+  root.querySelectorAll('.import-one-btn').forEach(btn => {
+    btn.addEventListener('click', async () => {
+      const idx = Number(btn.dataset.idx)
+      const lead = discoveryResults[idx]
+      if (!lead) return
+      btn.disabled = true
+      btn.textContent = 'Importando...'
+      await importLead(lead, root)
+      btn.textContent = 'Importado ✓'
+    })
+  })
 }
 
 async function loadTable(root) {
