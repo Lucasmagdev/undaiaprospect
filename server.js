@@ -22,6 +22,7 @@ const EVOLUTION_URL = process.env.EVOLUTION_URL || 'https://evolution.botcruzeir
 const EVOLUTION_API_KEY = process.env.EVOLUTION_API_KEY || ''
 const SUPABASE_URL = (process.env.SUPABASE_URL || '').replace(/\/$/, '')
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || ''
+const FOURSQUARE_API_KEY = process.env.FOURSQUARE_API_KEY || ''
 
 const ALLOWED_ORIGINS = new Set([
   process.env.CORS_ORIGIN || 'http://127.0.0.1:5173',
@@ -125,7 +126,25 @@ async function supabaseRequest(path, options = {}) {
 }
 
 function normalizePhone(value) {
-  return String(value || '').replace(/[\s+\-().]/g, '')
+  const raw = String(value || '')
+  const candidates = raw
+    .split(/[;,/|]/)
+    .map(part => part.replace(/\D/g, ''))
+    .filter(part => /^\d{10,15}$/.test(part))
+  if (candidates.length) return candidates[0]
+  return raw.replace(/\D/g, '')
+}
+
+// Returns 'mobile', 'landline', or 'unknown' based on Brazilian DDD rules.
+// Mobile: DDD (2) + 9XXXXXXXX (9 digits starting with 9) = 11 digits
+// Landline: DDD (2) + 8 digits = 10 digits
+function classifyBrazilianPhone(digits) {
+  let d = String(digits || '').replace(/\D/g, '')
+  if ((d.length === 12 || d.length === 13) && d.startsWith('55')) d = d.slice(2)
+  if (d.length === 11 && d[2] === '9') return 'mobile'
+  if (d.length === 10) return 'landline'
+  if (d.length === 11) return 'landline'
+  return 'unknown'
 }
 
 function sanitizeLike(value) {
@@ -311,6 +330,42 @@ async function findDefaultOpenInstance() {
   return result.ok && Array.isArray(result.data) ? result.data[0] : null
 }
 
+async function listApprovedCampaignLeads(campaign) {
+  // Busca mais do que o necessário para compensar os que serão filtrados
+  const requested = Math.max(1, Number(campaign.quantity_requested || 20))
+  const params = [
+    'select=id,name,phone,normalized_phone,niche,city,address,website,status',
+    'status=eq.qualified',
+    `niche=eq.${encodeURIComponent(campaign.niche)}`,
+    `city=eq.${encodeURIComponent(campaign.city)}`,
+    'or=(phone.not.is.null,normalized_phone.not.is.null)',
+    'order=created_at.asc',
+    `limit=${Math.min(requested * 3, 300)}`,
+  ]
+  const result = await supabaseRequest(`/leads?${params.join('&')}`)
+  if (!result.ok || !Array.isArray(result.data)) return []
+
+  let leads = result.data
+    .map(lead => ({ ...lead, phone: normalizePhone(lead.phone || lead.normalized_phone) }))
+    .filter(lead => /^\d{10,15}$/.test(lead.phone))
+    .filter(lead => classifyBrazilianPhone(lead.phone) === 'mobile')
+
+  // Verificação de WhatsApp via Evolution (best-effort — se falhar, usa lista como está)
+  const instance = await findDefaultOpenInstance()
+  if (instance && leads.length > 0) {
+    const phones = leads.map(l => l.phone)
+    const waCheck = await checkWhatsAppNumbers(instance.evolution_instance_name, phones)
+    if (waCheck && waCheck.length > 0) {
+      const waSet = new Set(
+        waCheck.filter(r => r.exists).map(r => String(r.number || r.jid || '').replace(/\D/g, ''))
+      )
+      if (waSet.size > 0) leads = leads.filter(l => waSet.has(l.phone))
+    }
+  }
+
+  return leads.slice(0, requested)
+}
+
 async function saveInboundMessage(payload) {
   const instanceName =
     payload?.instance ||
@@ -382,6 +437,10 @@ async function runCampaignBackground(campaignId, campaign, leads, templateBody, 
         status: 'new',
       })
       leadRecord = saveRes.data?.[0] || null
+    }
+    if (leadRecord?.status === 'opt_out' || leadRecord?.status === 'invalid') {
+      failed += 1
+      continue
     }
 
     const clExists = await supabaseRequest(`/campaign_leads?campaign_id=eq.${encodeURIComponent(campaignId)}&lead_id=eq.${encodeURIComponent(leadRecord?.id || '')}&select=id&limit=1`)
@@ -463,6 +522,188 @@ function normalizeQrCode(data) {
   }
 }
 
+const NICHE_TAGS = {
+  restaurante:   [['amenity', 'restaurant'], ['amenity', 'fast_food'], ['amenity', 'cafe'], ['shop', 'deli']],
+  odontologia:   [['amenity', 'dentist'], ['healthcare', 'dentist'], ['healthcare:speciality', 'dentistry']],
+  academia:      [['leisure', 'fitness_centre'], ['amenity', 'gym'], ['leisure', 'sports_centre']],
+  advocacia:     [['office', 'lawyer'], ['office', 'law_firm']],
+  contabilidade: [['office', 'accountant'], ['office', 'tax_advisor'], ['office', 'financial']],
+  estetica:      [['shop', 'beauty'], ['amenity', 'beauty_salon'], ['amenity', 'nail_salon'], ['shop', 'cosmetics']],
+  imobiliaria:   [['shop', 'estate_agent'], ['office', 'estate_agent']],
+}
+
+// Termos de busca em português para Foursquare/scrapers
+const NICHE_TERMS = {
+  restaurante:   'restaurante',
+  odontologia:   'dentista clinica odontologica',
+  academia:      'academia fitness',
+  advocacia:     'advogado escritorio advocacia',
+  contabilidade: 'contabilidade contador',
+  estetica:      'estetica beleza salao',
+  imobiliaria:   'imobiliaria corretor imoveis',
+}
+
+async function fetchOverpassLeads(niche, city, limit) {
+  const tags = NICHE_TAGS[niche] || [['name', niche]]
+  const unionParts = tags.flatMap(([k, v]) => [
+    `node["${k}"="${v}"](area.a);`,
+    `way["${k}"="${v}"](area.a);`,
+  ]).join('')
+  // Removido ["boundary"="administrative"] — era muito restritivo para cidades BR no OSM.
+  // admin_level 8 cobre municípios brasileiros; fallback para 7 cobre alguns casos especiais.
+  const query = `[out:json][timeout:30];(area["name"="${city}"]["admin_level"="8"];area["name"="${city}"]["admin_level"="7"];)->.a;(${unionParts});out center tags ${limit};`
+
+  const r = await fetch('https://overpass-api.de/api/interpreter', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'Accept': '*/*', 'User-Agent': 'undaia-prospect/1.0' },
+    body: new URLSearchParams({ data: query }),
+    signal: AbortSignal.timeout(35_000),
+  })
+  if (!r.ok) return []
+  const raw = await r.json()
+  return (raw.elements || [])
+    .filter(el => el.tags?.name)
+    .map(el => {
+      const t = el.tags || {}
+      const phone = normalizePhone(t.phone || t['contact:phone'] || t['contact:mobile'] || '')
+      return {
+        name: t.name || '',
+        phone: phone || null,
+        address: [t['addr:street'], t['addr:housenumber'], t['addr:suburb']].filter(Boolean).join(', ') || null,
+        website: t.website || t['contact:website'] || null,
+        niche,
+        city,
+        lat: el.lat || el.center?.lat || null,
+        lon: el.lon || el.center?.lon || null,
+        osm_id: String(el.id),
+        source: 'overpass',
+      }
+    })
+}
+
+// Extrai todos os blocos JSON-LD de uma página HTML
+function extractJsonLd(html) {
+  const out = []
+  const re = /<script[^>]+type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi
+  let m
+  while ((m = re.exec(html)) !== null) {
+    try {
+      const parsed = JSON.parse(m[1])
+      if (Array.isArray(parsed)) out.push(...parsed)
+      else out.push(parsed)
+    } catch { /* skip malformed block */ }
+  }
+  return out
+}
+
+function jsonLdToLead(item, niche, city, source) {
+  if (!item?.name) return null
+  const type = String(item['@type'] || '').toLowerCase()
+  if (!type.includes('business') && !type.includes('organization') && !type.includes('place') && !type.includes('local')) return null
+  const phone = normalizePhone(item.telephone || item.phone || '')
+  return {
+    name: item.name,
+    phone: phone || null,
+    address: typeof item.address === 'string'
+      ? item.address
+      : [item.address?.streetAddress, item.address?.addressLocality].filter(Boolean).join(', ') || null,
+    website: item.url || item.sameAs || null,
+    niche,
+    city,
+    source,
+  }
+}
+
+const SCRAPER_HEADERS = {
+  'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+  'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+  'Accept-Language': 'pt-BR,pt;q=0.9',
+}
+
+async function fetchGuiaMaisLeads(niche, city, limit) {
+  const term = encodeURIComponent(NICHE_TERMS[niche] || niche)
+  const where = encodeURIComponent(city)
+  let html
+  try {
+    const r = await fetch(
+      `https://www.guiamais.com.br/busca?searchedTerm=${term}&where=${where}`,
+      { headers: SCRAPER_HEADERS, signal: AbortSignal.timeout(15_000) },
+    )
+    if (!r.ok) return []
+    html = await r.text()
+  } catch {
+    return []
+  }
+  return extractJsonLd(html)
+    .map(item => jsonLdToLead(item, niche, city, 'guiamais'))
+    .filter(Boolean)
+    .slice(0, limit)
+}
+
+async function fetchApontadorLeads(niche, city, limit) {
+  const what = encodeURIComponent(NICHE_TERMS[niche] || niche)
+  const where = encodeURIComponent(city)
+  let html
+  try {
+    const r = await fetch(
+      `https://www.apontador.com.br/local/search/result/page/1?what=${what}&where=${where}`,
+      { headers: SCRAPER_HEADERS, signal: AbortSignal.timeout(15_000) },
+    )
+    if (!r.ok) return []
+    html = await r.text()
+  } catch {
+    return []
+  }
+  return extractJsonLd(html)
+    .map(item => jsonLdToLead(item, niche, city, 'apontador'))
+    .filter(Boolean)
+    .slice(0, limit)
+}
+
+async function fetchFoursquareLeads(niche, city, limit) {
+  if (!FOURSQUARE_API_KEY) return []
+  const term = encodeURIComponent(NICHE_TERMS[niche] || niche)
+  const near = encodeURIComponent(`${city}, Brazil`)
+  let data
+  try {
+    const r = await fetch(
+      `https://api.foursquare.com/v3/places/search?query=${term}&near=${near}&limit=${Math.min(limit, 50)}&fields=fsq_id,name,location,tel,website,geocodes`,
+      {
+        headers: { 'Authorization': FOURSQUARE_API_KEY, 'Accept': 'application/json' },
+        signal: AbortSignal.timeout(15_000),
+      },
+    )
+    data = await r.json()
+  } catch {
+    return []
+  }
+  if (!Array.isArray(data.results)) return []
+  return data.results.map(p => ({
+    name: p.name || '',
+    phone: p.tel ? normalizePhone(p.tel) : null,
+    address: [p.location?.address, p.location?.locality].filter(Boolean).join(', ') || null,
+    website: p.website || null,
+    niche,
+    city,
+    lat: p.geocodes?.main?.latitude || null,
+    lon: p.geocodes?.main?.longitude || null,
+    source: 'foursquare',
+  }))
+}
+
+async function checkWhatsAppNumbers(instanceName, phones) {
+  try {
+    const result = await evolutionRequest(
+      `/chat/whatsappNumbers/${encodeURIComponent(instanceName)}`,
+      { method: 'POST', body: JSON.stringify({ numbers: phones }), signal: AbortSignal.timeout(8_000) },
+    )
+    if (!result.ok || !Array.isArray(result.data)) return null
+    return result.data
+  } catch {
+    return null
+  }
+}
+
 async function handleApi(req, res, url) {
   const reqOrigin = req.headers.origin || ''
   const sendJson = (r, s, d) => _sendJson(r, s, d, reqOrigin)
@@ -533,14 +774,16 @@ async function handleApi(req, res, url) {
   if (url.pathname === '/api/leads' && req.method === 'GET') {
     const search = sanitizeLike(url.searchParams.get('search'))
     const hasWebsite = url.searchParams.get('hasWebsite')
+    const status = sanitizeLike(url.searchParams.get('status'))
     const params = [
-      'select=id,name,phone,normalized_phone,niche,city,address,website,status,last_interaction_at,created_at',
+      'select=id,name,phone,normalized_phone,niche,city,address,website,source,status,last_interaction_at,created_at',
       'order=created_at.desc',
       'limit=200',
     ]
     if (search) params.push(`or=(name.ilike.*${encodeURIComponent(search)}*,niche.ilike.*${encodeURIComponent(search)}*,city.ilike.*${encodeURIComponent(search)}*)`)
     if (hasWebsite === 'true') params.push('website=not.is.null')
     if (hasWebsite === 'false') params.push('website=is.null')
+    if (status) params.push(`status=eq.${encodeURIComponent(status)}`)
     const result = await supabaseRequest(`/leads?${params.join('&')}`)
     return sendJson(res, result.status, result.data)
   }
@@ -559,6 +802,23 @@ async function handleApi(req, res, url) {
       website: body.website || null,
       source: body.source || 'manual',
       status: body.status || 'new',
+    })
+    return sendJson(res, result.status, result.data?.[0] || result.data)
+  }
+
+  const leadStatusMatch = url.pathname.match(/^\/api\/leads\/([^/]+)\/status$/)
+  if (leadStatusMatch && req.method === 'PATCH') {
+    const leadId = leadStatusMatch[1]
+    const body = await readBody(req)
+    const allowed = new Set(['new', 'qualified', 'invalid', 'opt_out'])
+    if (!allowed.has(body.status)) return sendJson(res, 400, { message: 'Status de lead invalido.' })
+    const patch = {
+      status: body.status,
+      last_interaction_at: ['qualified', 'invalid', 'opt_out'].includes(body.status) ? new Date().toISOString() : null,
+    }
+    const result = await supabaseRequest(`/leads?id=eq.${encodeURIComponent(leadId)}`, {
+      method: 'PATCH',
+      body: JSON.stringify(patch),
     })
     return sendJson(res, result.status, result.data?.[0] || result.data)
   }
@@ -882,50 +1142,19 @@ async function handleApi(req, res, url) {
     }
     if (!templateBody) return sendJson(res, 400, { message: 'Template nao configurado na campanha.' })
 
-    const overpassTags = {
-      restaurante: [['amenity', 'restaurant']],
-      odontologia: [['amenity', 'dentist'], ['healthcare', 'dentist']],
-      academia: [['leisure', 'fitness_centre'], ['amenity', 'gym']],
-      advocacia: [['office', 'lawyer'], ['office', 'law_firm']],
-      contabilidade: [['office', 'accountant'], ['office', 'tax_advisor']],
-      estetica: [['shop', 'beauty'], ['amenity', 'beauty_salon']],
-      imobiliaria: [['shop', 'estate_agent'], ['office', 'estate_agent']],
+    const approvedLeads = await listApprovedCampaignLeads(campaign)
+    if (!approvedLeads.length) {
+      return sendJson(res, 409, {
+        message: 'Nenhum lead aprovado para esta campanha. Importe leads e aprove manualmente antes de disparar.',
+        safety: 'campaign_requires_qualified_leads',
+      })
     }
-    const tags = overpassTags[campaign.niche] || [['name', campaign.niche]]
-    const unionParts = tags.flatMap(([k, v]) => [`node["${k}"="${v}"](area.a);`, `way["${k}"="${v}"](area.a);`]).join('')
-    const overpassQuery = `[out:json][timeout:30];area["name"="${campaign.city}"]["boundary"="administrative"]->.a;(${unionParts});out body ${campaign.quantity_requested};`
-
-    let overpassData = { elements: [] }
-    try {
-      const oRes = await fetch('https://overpass-api.de/api/interpreter', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'Accept': '*/*', 'User-Agent': 'undaia-prospect/1.0' },
-        body: new URLSearchParams({ data: overpassQuery }),
-        signal: AbortSignal.timeout(35_000),
-      })
-      if (oRes.ok) overpassData = await oRes.json()
-    } catch { /* sem leads do overpass, usa apenas leads importados */ }
-
-    const overpassLeads = (overpassData.elements || [])
-      .filter(el => el.tags?.name && normalizePhone(el.tags?.phone || el.tags?.['contact:phone'] || el.tags?.['contact:mobile'] || ''))
-      .map(el => {
-        const t = el.tags || {}
-        return {
-          name: t.name,
-          phone: normalizePhone(t.phone || t['contact:phone'] || t['contact:mobile'] || ''),
-          address: [t['addr:street'], t['addr:housenumber']].filter(Boolean).join(', ') || null,
-          website: t.website || t['contact:website'] || null,
-          niche: campaign.niche,
-          city: campaign.city,
-          source: 'overpass',
-        }
-      })
 
     await patchCampaign(campaignId, { status: 'running', started_at: new Date().toISOString(), sent_count: 0, failed_count: 0 })
 
-    sendJson(res, 202, { message: 'Campanha iniciada.', total: overpassLeads.length, instance: instance.evolution_instance_name })
+    sendJson(res, 202, { message: 'Campanha iniciada com leads aprovados.', total: approvedLeads.length, instance: instance.evolution_instance_name })
 
-    runCampaignBackground(campaignId, campaign, overpassLeads, templateBody, instance).catch(() => {
+    runCampaignBackground(campaignId, campaign, approvedLeads, templateBody, instance).catch(() => {
       patchCampaign(campaignId, { status: 'error' })
     })
     return
@@ -1078,66 +1307,40 @@ async function handleApi(req, res, url) {
 
     if (!niche || !city) return sendJson(res, 400, { message: 'niche e city sao obrigatorios.' })
 
-    const NICHE_TAGS = {
-      restaurante: [['amenity', 'restaurant']],
-      odontologia: [['amenity', 'dentist'], ['healthcare', 'dentist']],
-      academia: [['leisure', 'fitness_centre'], ['amenity', 'gym']],
-      advocacia: [['office', 'lawyer'], ['office', 'law_firm']],
-      contabilidade: [['office', 'accountant'], ['office', 'tax_advisor']],
-      estetica: [['shop', 'beauty'], ['amenity', 'beauty_salon']],
-      imobiliaria: [['shop', 'estate_agent'], ['office', 'estate_agent']],
+    const [overpassSettled, fsqSettled, guiamaisSettled, apontadorSettled] = await Promise.allSettled([
+      fetchOverpassLeads(niche, city, limit),
+      fetchFoursquareLeads(niche, city, limit),
+      fetchGuiaMaisLeads(niche, city, limit),
+      fetchApontadorLeads(niche, city, limit),
+    ])
+
+    const overpassLeads  = overpassSettled.status  === 'fulfilled' ? overpassSettled.value  : []
+    const fsqLeads       = fsqSettled.status       === 'fulfilled' ? fsqSettled.value       : []
+    const guiamaisLeads  = guiamaisSettled.status  === 'fulfilled' ? guiamaisSettled.value  : []
+    const apontadorLeads = apontadorSettled.status === 'fulfilled' ? apontadorSettled.value : []
+
+    const all = [...overpassLeads, ...fsqLeads, ...guiamaisLeads, ...apontadorLeads]
+    if (!all.length) {
+      return sendJson(res, 502, { message: 'Nenhuma fonte retornou resultados. Tente novamente em instantes.' })
     }
 
-    const tags = NICHE_TAGS[niche] || [['name', niche]]
-    const unionParts = tags.flatMap(([k, v]) => [
-      `node["${k}"="${v}"](area.a);`,
-      `way["${k}"="${v}"](area.a);`,
-    ]).join('')
-
-    const overpassQuery = `[out:json][timeout:30];area["name"="${city}"]["boundary"="administrative"]->.a;(${unionParts});out body ${limit};`
-
-    let overpassRes
-    try {
-      overpassRes = await fetch('https://overpass-api.de/api/interpreter', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/x-www-form-urlencoded',
-          'Accept': '*/*',
-          'User-Agent': 'undaia-prospect/1.0',
-        },
-        body: new URLSearchParams({ data: overpassQuery }),
-        signal: AbortSignal.timeout(35_000),
-      })
-    } catch (err) {
-      return sendJson(res, 502, { message: `Overpass indisponivel: ${err.message}` })
+    // Merge: deduplica por telefone normalizado.
+    // Prioridade: foursquare > guiamais > apontador > overpass (mais confiáveis no final da lista sobrescrevem)
+    const phoneMap = new Map()
+    const noPhoneLeads = []
+    for (const lead of [...overpassLeads, ...fsqLeads, ...guiamaisLeads, ...apontadorLeads]) {
+      if (!lead.phone) { noPhoneLeads.push(lead); continue }
+      if (!phoneMap.has(lead.phone) || ['foursquare', 'guiamais', 'apontador'].includes(lead.source)) {
+        phoneMap.set(lead.phone, lead)
+      }
     }
 
-    if (!overpassRes.ok) {
-      const text = await overpassRes.text()
-      return sendJson(res, 502, { message: `Overpass erro ${overpassRes.status}`, detail: text.slice(0, 300) })
-    }
-
-    const raw = await overpassRes.json()
-    const elements = raw.elements || []
-
-    const results = elements
-      .filter(el => el.tags?.name)
-      .map(el => {
-        const t = el.tags || {}
-        const phone = normalizePhone(t.phone || t['contact:phone'] || t['contact:mobile'] || '')
-        return {
-          name: t.name || '',
-          phone: phone || null,
-          address: [t['addr:street'], t['addr:housenumber'], t['addr:suburb']].filter(Boolean).join(', ') || null,
-          website: t.website || t['contact:website'] || null,
-          niche,
-          city,
-          lat: el.lat || el.center?.lat || null,
-          lon: el.lon || el.center?.lon || null,
-          osm_id: String(el.id),
-          source: 'overpass',
-        }
-      })
+    const results = [...phoneMap.values(), ...noPhoneLeads]
+      .map(lead => ({
+        ...lead,
+        phone_type: lead.phone ? classifyBrazilianPhone(lead.phone) : 'unknown',
+      }))
+      .slice(0, limit)
 
     return sendJson(res, 200, results)
   }

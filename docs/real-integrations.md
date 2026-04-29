@@ -83,3 +83,11 @@ No desenvolvimento local, use um tunel HTTPS quando precisar testar webhooks ext
 - Google Places ainda nao esta integrado; o MVP usa Overpass/OSM para descoberta real de leads.
 - A fila real com delay 30-60s, limite diario e retomada de campanha ainda precisa de worker.
 - Autenticacao de usuarios/SaaS ainda nao foi adicionada.
+
+## Segurança de Envio
+
+- Leads importados entram como `new`/pendentes.
+- Campanhas normais so disparam para leads `qualified`/aprovados.
+- `invalid` e `opt_out` nunca devem voltar para disparo.
+- Revise telefone, cidade, nome e fonte antes de aprovar.
+- Comece com baixo volume, mensagens curtas, sem link no primeiro contato e com pergunta de permissao.

@@ -2,17 +2,17 @@ import { leadStatus, skeletonTable, emptyState, skeletonCards } from '../compone
 import { toast } from '../toast.js'
 import { LeadService } from '../services.js'
 
-let filters = { hasWebsite: null, search: '' }
+let filters = { hasWebsite: null, status: null, search: '' }
 let discoveryResults = []
 
 const NICHES = [
   { value: 'restaurante', label: 'Restaurante' },
   { value: 'odontologia', label: 'Odontologia' },
-  { value: 'academia',    label: 'Academia' },
-  { value: 'advocacia',   label: 'Advocacia' },
+  { value: 'academia', label: 'Academia' },
+  { value: 'advocacia', label: 'Advocacia' },
   { value: 'contabilidade', label: 'Contabilidade' },
-  { value: 'estetica',    label: 'Clínica Estética' },
-  { value: 'imobiliaria', label: 'Imobiliária' },
+  { value: 'estetica', label: 'Clinica Estetica' },
+  { value: 'imobiliaria', label: 'Imobiliaria' },
 ]
 
 function websiteHref(value) {
@@ -20,23 +20,59 @@ function websiteHref(value) {
   return /^https?:\/\//i.test(value) ? value : `https://${value}`
 }
 
+function safetyStatus(status) {
+  return {
+    new: 'Pendente',
+    qualified: 'Aprovado',
+    invalid: 'Rejeitado',
+    opt_out: 'Opt-out',
+    sent: 'Enviado',
+    responded: 'Respondeu',
+    closed: 'Fechado',
+  }[status] || status
+}
+
+function phoneTypeBadge(type) {
+  if (type === 'mobile') return '<span class="badge-success" title="Celular — potencial WhatsApp">Celular</span>'
+  if (type === 'landline') return '<span class="badge-warning" title="Fixo — improvavel WhatsApp">Fixo</span>'
+  return '<span class="badge-neutral" title="Tipo desconhecido">?</span>'
+}
+
+function sourceBadge(source) {
+  const map = {
+    overpass:    'OSM',
+    foursquare:  '4sq',
+    guiamais:    'GuiaMais',
+    apontador:   'Apontador',
+    google_places: 'Google',
+  }
+  return `<span class="badge-neutral" style="font-size:10px">${map[source] || source}</span>`
+}
+
 function renderDiscoveryResults() {
   if (!discoveryResults.length) return ''
+  const mobile = discoveryResults.filter(l => l.phone_type === 'mobile').length
+  const total = discoveryResults.length
   return `
     <div class="discovery-results">
       <div class="discovery-results-head">
-        <strong>${discoveryResults.length} leads encontrados</strong>
-        <button class="primary import-all-btn" type="button">Importar todos</button>
+        <strong>${total} leads encontrados</strong>
+        <span class="muted" style="font-size:12px">${mobile} celulares / ${total - mobile} fixos ou sem telefone</span>
+        <button class="primary import-all-btn" type="button">Importar para revisao</button>
       </div>
       <div class="discovery-cards">
         ${discoveryResults.map((lead, i) => `
           <div class="discovery-card" data-idx="${i}">
             <div class="discovery-card-head">
               <strong>${lead.name}</strong>
-              ${lead.phone ? `<span class="discovery-phone">${lead.phone}</span>` : '<span class="muted">sem telefone</span>'}
+              <div style="display:flex;gap:4px;align-items:center">
+                ${sourceBadge(lead.source)}
+                ${lead.phone ? phoneTypeBadge(lead.phone_type) : ''}
+              </div>
             </div>
+            ${lead.phone ? `<span class="discovery-phone">${lead.phone}</span>` : '<span class="muted">sem telefone</span>'}
             ${lead.address ? `<p class="discovery-addr">${lead.address}</p>` : ''}
-            ${lead.website ? `<a href="${lead.website}" target="_blank" rel="noopener" class="discovery-site">${lead.website}</a>` : ''}
+            ${lead.website ? `<a href="${websiteHref(lead.website)}" target="_blank" rel="noopener" class="discovery-site">${lead.website}</a>` : ''}
             <button class="secondary import-one-btn" type="button" data-idx="${i}">Importar</button>
           </div>
         `).join('')}
@@ -57,7 +93,7 @@ export function render() {
     <article class="panel prospect-panel">
       <div class="panel-head">
         <h2>Prospectar leads</h2>
-        <span class="badge-neutral">Overpass / OSM</span>
+        <span class="badge-neutral">OSM + Foursquare + Guia Mais + Apontador</span>
       </div>
       <form class="prospect-form" autocomplete="off">
         <label>Nicho
@@ -66,13 +102,16 @@ export function render() {
           </select>
         </label>
         <label>Cidade
-          <input name="city" value="Belo Horizonte" placeholder="Ex: São Paulo" />
+          <input name="city" value="Belo Horizonte" placeholder="Ex: Sao Paulo" />
         </label>
         <label>Limite
           <input name="limit" type="number" value="30" min="5" max="100" />
         </label>
         <button class="primary prospect-btn" type="submit">Buscar leads</button>
       </form>
+      <p class="muted" style="margin-top:10px;font-size:12px">
+        Leads importados entram como pendentes. Aprove manualmente antes de qualquer campanha.
+      </p>
       <div class="prospect-results"></div>
     </article>
 
@@ -83,6 +122,9 @@ export function render() {
       </div>
       <div class="filters">
         <button class="secondary filter-btn" data-filter="all">Todos</button>
+        <button class="secondary status-filter-btn" data-status="new">Pendentes</button>
+        <button class="secondary status-filter-btn" data-status="qualified">Aprovados</button>
+        <button class="secondary status-filter-btn" data-status="invalid">Rejeitados</button>
         <button class="secondary filter-btn" data-filter="website">Com site</button>
         <button class="secondary filter-btn" data-filter="no-website">Sem site</button>
         <button class="secondary" id="export-btn">
@@ -93,7 +135,7 @@ export function render() {
     </div>
 
     <section class="table-card" id="leads-table">
-      ${skeletonTable(4, 7)}
+      ${skeletonTable(4, 8)}
     </section>
   `
 }
@@ -107,10 +149,10 @@ async function importLead(lead, root) {
       website: lead.website || null,
       niche: lead.niche,
       city: lead.city,
-      source: 'overpass',
+      source: lead.source || 'overpass',
       status: 'new',
     })
-    toast(`${lead.name} importado.`, 'success')
+    toast(`${lead.name} importado para revisao.`, 'success')
     await loadTable(root)
   } catch (err) {
     toast(err.message, 'error')
@@ -130,20 +172,20 @@ async function importAll(root) {
         website: lead.website || null,
         niche: lead.niche,
         city: lead.city,
-        source: 'overpass',
+        source: lead.source || 'overpass',
         status: 'new',
       })
       ok++
     } catch { /* skip duplicates */ }
   }
-  toast(`${ok} leads importados.`, 'success')
+  toast(`${ok} leads importados para revisao.`, 'success')
   discoveryResults = []
   root.querySelector('.prospect-results').innerHTML = ''
   await loadTable(root)
 }
 
 export async function setup(root) {
-  filters = { hasWebsite: null, search: '' }
+  filters = { hasWebsite: null, status: null, search: '' }
   discoveryResults = []
 
   root.querySelector('.prospect-form').addEventListener('submit', async event => {
@@ -181,9 +223,22 @@ export async function setup(root) {
   root.querySelectorAll('.filter-btn').forEach(btn => {
     btn.addEventListener('click', () => {
       root.querySelectorAll('.filter-btn').forEach(b => b.classList.remove('active'))
+      root.querySelectorAll('.status-filter-btn').forEach(b => b.classList.remove('active'))
       btn.classList.add('active')
       const f = btn.dataset.filter
       filters.hasWebsite = f === 'website' ? true : f === 'no-website' ? false : null
+      filters.status = null
+      loadTable(root)
+    })
+  })
+
+  root.querySelectorAll('.status-filter-btn').forEach(btn => {
+    btn.addEventListener('click', () => {
+      root.querySelectorAll('.filter-btn').forEach(b => b.classList.remove('active'))
+      root.querySelectorAll('.status-filter-btn').forEach(b => b.classList.remove('active'))
+      btn.classList.add('active')
+      filters.hasWebsite = null
+      filters.status = btn.dataset.status
       loadTable(root)
     })
   })
@@ -223,20 +278,30 @@ function bindDiscoveryActions(root) {
       btn.disabled = true
       btn.textContent = 'Importando...'
       await importLead(lead, root)
-      btn.textContent = 'Importado ✓'
+      btn.textContent = 'Importado'
     })
   })
 }
 
+async function updateLeadStatus(id, status, root) {
+  try {
+    await LeadService.updateStatus(id, status)
+    toast(`Lead marcado como ${safetyStatus(status).toLowerCase()}.`, 'success')
+    await loadTable(root)
+  } catch (err) {
+    toast(err.message, 'error')
+  }
+}
+
 async function loadTable(root) {
   const table = root.querySelector('#leads-table')
-  table.innerHTML = skeletonTable(4, 7)
+  table.innerHTML = skeletonTable(4, 8)
 
   let leads
   try {
     leads = await LeadService.list(filters)
   } catch {
-    table.innerHTML = `<div style="padding:24px">${emptyState('Erro ao carregar leads', 'Verifique a conexão e tente novamente.')}</div>`
+    table.innerHTML = `<div style="padding:24px">${emptyState('Erro ao carregar leads', 'Verifique a conexao e tente novamente.')}</div>`
     return
   }
 
@@ -251,23 +316,34 @@ async function loadTable(root) {
         <thead>
           <tr>
             <th>Empresa</th><th>Telefone</th><th>Cidade</th>
-            <th>Nicho</th><th>Website</th><th>Status</th><th>Última interação</th>
+            <th>Nicho</th><th>Website</th><th>Fonte</th><th>Revisao</th><th>Acoes</th>
           </tr>
         </thead>
         <tbody>
           ${leads.map(l => `
-            <tr>
+            <tr data-lead-id="${l.id}">
               <td><strong>${l.name}</strong></td>
               <td>${l.phone}</td>
               <td>${l.city}</td>
               <td>${l.niche}</td>
               <td>${l.website === 'sem site' ? `<span class="muted">sem site</span>` : `<a href="${websiteHref(l.website)}" target="_blank" rel="noopener" style="color:var(--green-600)">${l.website}</a>`}</td>
-              <td>${leadStatus(l.status)}</td>
-              <td>${l.last}</td>
+              <td>${l.source}</td>
+              <td>${leadStatus(l.status)}<br><span class="muted" style="font-size:11px">${safetyStatus(l.status)}</span></td>
+              <td>
+                <div style="display:flex;gap:6px;flex-wrap:wrap">
+                  ${l.status !== 'qualified' ? `<button class="secondary lead-status-action" data-id="${l.id}" data-status="qualified" style="padding:5px 9px;font-size:12px">Aprovar</button>` : ''}
+                  ${l.status !== 'invalid' ? `<button class="secondary lead-status-action" data-id="${l.id}" data-status="invalid" style="padding:5px 9px;font-size:12px">Rejeitar</button>` : ''}
+                  ${l.status !== 'opt_out' ? `<button class="secondary lead-status-action" data-id="${l.id}" data-status="opt_out" style="padding:5px 9px;font-size:12px">Opt-out</button>` : ''}
+                </div>
+              </td>
             </tr>
           `).join('')}
         </tbody>
       </table>
     </div>
   `
+
+  table.querySelectorAll('.lead-status-action').forEach(btn => {
+    btn.addEventListener('click', () => updateLeadStatus(btn.dataset.id, btn.dataset.status, root))
+  })
 }

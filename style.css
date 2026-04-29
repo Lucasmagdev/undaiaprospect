@@ -672,6 +672,19 @@ input:focus {
   border-color: var(--blue-border);
 }
 
+.lead-status.qualified {
+  background: var(--green-bg);
+  color: var(--green-700);
+  border-color: var(--green-border);
+}
+
+.lead-status.invalid,
+.lead-status.opt_out {
+  background: #fee2e2;
+  color: #b91c1c;
+  border-color: #fecaca;
+}
+
 .badge.futuro,
 .lead-status.novo {
   background: var(--slate-bg);

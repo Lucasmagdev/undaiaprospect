@@ -214,6 +214,7 @@ export const LeadService = {
     if (filters.hasWebsite !== null && filters.hasWebsite !== undefined) {
       params.set('hasWebsite', String(filters.hasWebsite))
     }
+    if (filters.status) params.set('status', filters.status)
     const leads = await apiFetch(`/api/leads${params.toString() ? `?${params}` : ''}`)
     return leads.map(l => ({
       id: l.id,
@@ -222,6 +223,7 @@ export const LeadService = {
       city: l.city || '—',
       niche: l.niche || '—',
       website: l.website || 'sem site',
+      source: l.source || 'manual',
       status: l.status || 'new',
       last: compactDate(l.last_interaction_at || l.created_at),
     }))
@@ -236,6 +238,13 @@ export const LeadService = {
     return apiFetch('/api/leads', {
       method: 'POST',
       body: JSON.stringify(lead),
+    })
+  },
+
+  async updateStatus(id, status) {
+    return apiFetch(`/api/leads/${encodeURIComponent(id)}/status`, {
+      method: 'PATCH',
+      body: JSON.stringify({ status }),
     })
   },
 
