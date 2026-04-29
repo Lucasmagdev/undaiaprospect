@@ -139,7 +139,7 @@ function compactDate(value) {
   return new Date(value).toLocaleString('pt-BR', { day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' })
 }
 
-function campaignStatus(status) {
+function campaignStatusLabel(status) {
   return {
     draft: 'Pausada',
     running: 'Rodando',
@@ -166,10 +166,14 @@ export const CampaignService = {
       name: c.name,
       niche: c.niche,
       city: c.city,
-      status: campaignStatus(c.status),
-      progress: c.status === 'finished' ? 100 : c.status === 'running' ? 35 : 0,
-      found: c.quantity_requested || 0,
-      sent: 0,
+      status: c.status,
+      status_label: campaignStatusLabel(c.status),
+      progress: c.quantity_requested ? Math.round(((Number(c.sent_count || 0) + Number(c.failed_count || 0)) / Number(c.quantity_requested)) * 100) : 0,
+      quantity_requested: Number(c.quantity_requested || 0),
+      sent_count: Number(c.sent_count || 0),
+      failed_count: Number(c.failed_count || 0),
+      found: Number(c.quantity_requested || 0),
+      sent: Number(c.sent_count || 0),
       replies: 0,
     }))
   },
@@ -181,10 +185,14 @@ export const CampaignService = {
     })
     return {
       ...campaign,
-      status: campaignStatus(campaign.status),
+      status: campaign.status,
+      status_label: campaignStatusLabel(campaign.status),
       progress: 0,
-      found: campaign.quantity_requested || 0,
-      sent: 0,
+      quantity_requested: Number(campaign.quantity_requested || 0),
+      sent_count: Number(campaign.sent_count || 0),
+      failed_count: Number(campaign.failed_count || 0),
+      found: Number(campaign.quantity_requested || 0),
+      sent: Number(campaign.sent_count || 0),
       replies: 0,
     }
   },
@@ -257,6 +265,8 @@ export const ConversationService = {
 function resolveTemplateBody(id) {
   if (id === null || id === undefined) return null
   if (typeof id === 'string') {
+    const template = _templates.find(t => String(t.id) === id)
+    if (template) return template.body
     for (const msgs of Object.values(_nicheBank)) {
       const found = msgs.find(m => m.id === id)
       if (found) return found.body

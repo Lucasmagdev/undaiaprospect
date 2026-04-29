@@ -3,22 +3,22 @@ import { toast } from '../toast.js'
 
 const integrations = [
   {
-    name: 'Google Places API',
+    name: 'Overpass / OSM',
     desc: 'Busca empresas, endereço, website e telefone quando disponível.',
-    status: 'Planejada',
-    docs: 'https://developers.google.com/maps/documentation/places',
+    status: 'Rodando',
+    docs: 'https://wiki.openstreetmap.org/wiki/Overpass_API',
   },
   {
     name: 'Supabase',
     desc: 'Banco de leads, campanhas, logs e templates.',
-    status: 'Planejada',
+    status: 'Rodando',
     docs: 'https://supabase.com/docs',
   },
   {
-    name: 'Z-API WhatsApp',
+    name: 'Evolution API WhatsApp',
     desc: 'Envio controlado e webhook de respostas.',
-    status: 'Planejada',
-    docs: 'https://developer.z-api.io',
+    status: 'Rodando',
+    docs: 'https://doc.evolution-api.com',
   },
   {
     name: 'OpenAI',

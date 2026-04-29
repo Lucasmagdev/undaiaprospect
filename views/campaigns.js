@@ -7,6 +7,16 @@ const NICHOS = ['restaurante', 'odontologia', 'academia', 'advocacia', 'contabil
 
 let pollingTimers = {}
 
+function statusLabel(status) {
+  return {
+    draft: 'Pausada',
+    running: 'Rodando',
+    paused: 'Pausada',
+    finished: 'Finalizada',
+    error: 'Erro',
+  }[status] || status
+}
+
 export function render() {
   return `
     <section class="section-head">
@@ -59,7 +69,7 @@ async function loadTable(root) {
               <td><strong>${c.name}</strong></td>
               <td>${c.niche}</td>
               <td>${c.city}</td>
-              <td class="camp-status-cell">${badge(c.status)}</td>
+              <td class="camp-status-cell">${badge(c.status_label || statusLabel(c.status))}</td>
               <td class="camp-sent-cell">${c.sent_count ?? 0}</td>
               <td class="camp-failed-cell">${c.failed_count ?? 0}</td>
               <td style="min-width:120px" class="camp-progress-cell">${progress(calcProgress(c))}</td>
@@ -84,8 +94,8 @@ async function loadTable(root) {
 
 function calcProgress(c) {
   if (c.status === 'finished') return 100
-  if (!c.quantity_requested || !c.sent_count) return 0
-  return Math.round((c.sent_count / c.quantity_requested) * 100)
+  if (!c.quantity_requested) return 0
+  return Math.round(((Number(c.sent_count || 0) + Number(c.failed_count || 0)) / c.quantity_requested) * 100)
 }
 
 async function runCampaign(id, root) {
@@ -109,7 +119,7 @@ function startPolling(id, root) {
       const s = await CampaignService.status(id)
       const row = root.querySelector(`tr[data-campaign-id="${id}"]`)
       if (!row) return
-      row.querySelector('.camp-status-cell').innerHTML = badge(s.status)
+      row.querySelector('.camp-status-cell').innerHTML = badge(statusLabel(s.status))
       row.querySelector('.camp-sent-cell').textContent = s.sent ?? 0
       row.querySelector('.camp-failed-cell').textContent = s.failed ?? 0
       row.querySelector('.camp-progress-cell').innerHTML = progress(s.total ? Math.round(((s.sent + s.failed) / s.total) * 100) : 0)

@@ -15,6 +15,11 @@ const NICHES = [
   { value: 'imobiliaria', label: 'Imobiliária' },
 ]
 
+function websiteHref(value) {
+  if (!value || value === 'sem site') return ''
+  return /^https?:\/\//i.test(value) ? value : `https://${value}`
+}
+
 function renderDiscoveryResults() {
   if (!discoveryResults.length) return ''
   return `
@@ -256,7 +261,7 @@ async function loadTable(root) {
               <td>${l.phone}</td>
               <td>${l.city}</td>
               <td>${l.niche}</td>
-              <td>${l.website === 'sem site' ? `<span class="muted">sem site</span>` : `<a href="https://${l.website}" target="_blank" rel="noopener" style="color:var(--green-600)">${l.website}</a>`}</td>
+              <td>${l.website === 'sem site' ? `<span class="muted">sem site</span>` : `<a href="${websiteHref(l.website)}" target="_blank" rel="noopener" style="color:var(--green-600)">${l.website}</a>`}</td>
               <td>${leadStatus(l.status)}</td>
               <td>${l.last}</td>
             </tr>

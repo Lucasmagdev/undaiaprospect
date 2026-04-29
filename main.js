@@ -69,7 +69,7 @@ function renderShell() {
         <div class="sidebar-status">
           <div class="live-dot"></div>
           <div class="sidebar-status-text">
-            <strong>Z-API conectada</strong>
+          <strong>Evolution conectada</strong>
             <p>Fila pronta para envio</p>
           </div>
         </div>

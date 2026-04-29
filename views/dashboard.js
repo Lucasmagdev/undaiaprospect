@@ -49,8 +49,8 @@ export function render() {
           <div class="live-dot"></div>
         </div>
         <ol class="activity" id="activity">
-          <li><time>agora</time><span>Webhook da Z-API recebeu 3 respostas hoje.</span></li>
-          <li><time>agora</time><span>Google Places retornou 84 empresas para Advocacia em Belo Horizonte.</span></li>
+          <li><time>agora</time><span>Webhook da Evolution recebeu respostas do WhatsApp.</span></li>
+          <li><time>agora</time><span>Overpass retornou empresas para Advocacia em Belo Horizonte.</span></li>
           <li><time>agora</time><span>Fila respeitando delay dinâmico entre 30 e 60 segundos.</span></li>
           <li><time>agora</time><span>Campanha pausada salva para retomada automática.</span></li>
         </ol>
@@ -64,7 +64,12 @@ export async function setup(root) {
 
   // Load campaigns
   const { CampaignService } = await import('../services.js')
-  const campaigns = await CampaignService.list()
+  let campaigns = []
+  try {
+    campaigns = await CampaignService.list()
+  } catch {
+    campaigns = []
+  }
   const list = root.querySelector('#campaigns-list')
   const head = root.querySelector('#campaigns-panel .muted')
   if (head) head.textContent = `${campaigns.length} no total`
@@ -75,7 +80,7 @@ export async function setup(root) {
           <strong>${c.name}</strong>
           <span>${c.niche} · ${c.city}</span>
         </div>
-        ${badge(c.status)}
+        ${badge(c.status_label || c.status)}
         <div class="campaign-progress">${progress(c.progress)}</div>
       </div>
     `).join('')
@@ -93,7 +98,7 @@ export async function setup(root) {
     state.paused = false
     pause.disabled = false
     pause.textContent = 'Pausar'
-    addLog(activity, 'Campanha iniciada. Buscando leads no Google Places...')
+    addLog(activity, 'Campanha simulada no painel. Para envio real, use a tela Campanhas.')
 
     state.timer = setInterval(() => {
       if (state.paused) return

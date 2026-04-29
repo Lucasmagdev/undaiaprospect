@@ -137,6 +137,118 @@ function formatSupabaseDate(value) {
   return new Date(value).toISOString()
 }
 
+function isMissingColumn(result) {
+  return result?.data?.code === '42703'
+}
+
+function isMissingRelation(result) {
+  return result?.data?.code === '42P01'
+}
+
+function isCheckViolation(result) {
+  return result?.data?.code === '23514'
+}
+
+function normalizeCampaignRecord(campaign = {}) {
+  return {
+    ...campaign,
+    sent_count: Number(campaign.sent_count || 0),
+    failed_count: Number(campaign.failed_count || 0),
+    delay_min_s: Number(campaign.delay_min_s ?? campaign.delay_min_seconds ?? 30),
+    delay_max_s: Number(campaign.delay_max_s ?? campaign.delay_max_seconds ?? 90),
+  }
+}
+
+function campaignPatchPayload(payload = {}, compat = false) {
+  const next = { ...payload }
+  if (compat) {
+    if ('sent_count' in next) delete next.sent_count
+    if ('failed_count' in next) delete next.failed_count
+    if ('delay_min_s' in next) {
+      next.delay_min_seconds = next.delay_min_s
+      delete next.delay_min_s
+    }
+    if ('delay_max_s' in next) {
+      next.delay_max_seconds = next.delay_max_s
+      delete next.delay_max_s
+    }
+  }
+  return next
+}
+
+async function patchCampaign(campaignId, payload) {
+  const path = `/campaigns?id=eq.${encodeURIComponent(campaignId)}`
+  let result = await supabaseRequest(path, {
+    method: 'PATCH',
+    body: JSON.stringify(campaignPatchPayload(payload)),
+  })
+
+  if (!result.ok && isMissingColumn(result)) {
+    result = await supabaseRequest(path, {
+      method: 'PATCH',
+      body: JSON.stringify(campaignPatchPayload(payload, true)),
+    })
+  }
+
+  return result
+}
+
+async function insertLeadRecord(record) {
+  const clean = {
+    ...record,
+    normalized_phone: normalizePhone(record.normalized_phone || record.phone) || null,
+  }
+
+  let result = await supabaseRequest('/leads', {
+    method: 'POST',
+    body: JSON.stringify(clean),
+  })
+
+  if (!result.ok && isCheckViolation(result) && clean.source === 'overpass') {
+    result = await supabaseRequest('/leads', {
+      method: 'POST',
+      body: JSON.stringify({ ...clean, source: 'import' }),
+    })
+  }
+
+  return result
+}
+
+async function createCampaignLead(record) {
+  const result = await supabaseRequest('/campaign_leads', {
+    method: 'POST',
+    body: JSON.stringify(record),
+  })
+  return isMissingRelation(result) ? { ok: true, status: 200, data: [] } : result
+}
+
+async function updateCampaignLead(id, payload) {
+  if (!id) return null
+  const result = await supabaseRequest(`/campaign_leads?id=eq.${encodeURIComponent(id)}`, {
+    method: 'PATCH',
+    body: JSON.stringify(payload),
+  })
+  return isMissingRelation(result) ? null : result
+}
+
+async function findCampaignLead(campaignId, leadId) {
+  if (!campaignId || !leadId) return null
+  const result = await supabaseRequest(`/campaign_leads?campaign_id=eq.${encodeURIComponent(campaignId)}&lead_id=eq.${encodeURIComponent(leadId)}&select=id&limit=1`)
+  return result.ok && Array.isArray(result.data) ? result.data[0] : null
+}
+
+async function campaignQueueRows(campaignId) {
+  const queueRes = await supabaseRequest(`/campaign_leads?campaign_id=eq.${encodeURIComponent(campaignId)}&select=status`)
+  if (queueRes.ok) return queueRes.data || []
+  if (!isMissingRelation(queueRes)) return []
+
+  const msgRes = await supabaseRequest(`/messages?campaign_id=eq.${encodeURIComponent(campaignId)}&select=status`)
+  if (!msgRes.ok) return []
+  return (msgRes.data || []).map(message => ({
+    status: message.status === 'sent' ? 'sent' : message.status === 'failed' ? 'failed' : 'pending',
+  }))
+}
+
 function instanceRecord(instance, overrides = {}) {
   const name = instance?.name || instance?.instanceName || instance?.instance?.instanceName || overrides.evolution_instance_name
   const record = {
@@ -258,25 +370,22 @@ async function runCampaignBackground(campaignId, campaign, leads, templateBody, 
 
     let leadRecord = await findLeadByPhone(lead.phone)
     if (!leadRecord) {
-      const saveRes = await supabaseRequest('/leads', {
-        method: 'POST',
-        body: JSON.stringify({
-          name: lead.name,
-          phone: lead.phone,
-          normalized_phone: lead.phone,
-          niche: lead.niche,
-          city: lead.city,
-          address: lead.address || null,
-          website: lead.website || null,
-          source: 'overpass',
-          status: 'new',
-        }),
+      const saveRes = await insertLeadRecord({
+        name: lead.name,
+        phone: lead.phone,
+        normalized_phone: lead.phone,
+        niche: lead.niche,
+        city: lead.city,
+        address: lead.address || null,
+        website: lead.website || null,
+        source: 'overpass',
+        status: 'new',
       })
       leadRecord = saveRes.data?.[0] || null
     }
 
     const clExists = await supabaseRequest(`/campaign_leads?campaign_id=eq.${encodeURIComponent(campaignId)}&lead_id=eq.${encodeURIComponent(leadRecord?.id || '')}&select=id&limit=1`)
-    if (clExists.data?.length) continue
+    if (clExists.ok && clExists.data?.length) continue
 
     const body = interpolate(templateBody, {
       nome_empresa: lead.name,
@@ -285,10 +394,7 @@ async function runCampaignBackground(campaignId, campaign, leads, templateBody, 
       servico: lead.niche,
     })
 
-    const clRes = await supabaseRequest('/campaign_leads', {
-      method: 'POST',
-      body: JSON.stringify({ campaign_id: campaignId, lead_id: leadRecord?.id || null, status: 'pending', scheduled_at: new Date().toISOString() }),
-    })
+    const clRes = await createCampaignLead({ campaign_id: campaignId, lead_id: leadRecord?.id || null, status: 'pending', scheduled_at: new Date().toISOString() })
     const clId = clRes.data?.[0]?.id
 
     const msgRecord = await insertMessage({
@@ -317,10 +423,7 @@ async function runCampaignBackground(campaignId, campaign, leads, templateBody, 
       : { status: 'failed', error_message: result.data?.message || 'Falha' }
 
     if (msgRecord?.id) await supabaseRequest(`/messages?id=eq.${encodeURIComponent(msgRecord.id)}`, { method: 'PATCH', body: JSON.stringify(patchMsg) })
-    if (clId) await supabaseRequest(`/campaign_leads?id=eq.${encodeURIComponent(clId)}`, {
-      method: 'PATCH',
-      body: JSON.stringify({ status: ok ? 'sent' : 'failed', message_id: msgRecord?.id || null, sent_at: new Date().toISOString(), error: ok ? null : result.data?.message }),
-    })
+    await updateCampaignLead(clId, { status: ok ? 'sent' : 'failed', message_id: msgRecord?.id || null, sent_at: new Date().toISOString(), error: ok ? null : result.data?.message })
     if (ok) {
       await incrementInstanceSentToday(instance.id, instance.sent_today + sent - 1)
       if (leadRecord?.id) {
@@ -331,19 +434,13 @@ async function runCampaignBackground(campaignId, campaign, leads, templateBody, 
       }
     }
 
-    await supabaseRequest(`/campaigns?id=eq.${encodeURIComponent(campaignId)}`, {
-      method: 'PATCH',
-      body: JSON.stringify({ sent_count: sent, failed_count: failed }),
-    })
+    await patchCampaign(campaignId, { sent_count: sent, failed_count: failed })
 
     const delay = (campaign.delay_min_s + Math.random() * (campaign.delay_max_s - campaign.delay_min_s)) * 1000
     await new Promise(r => setTimeout(r, delay))
   }
 
-  await supabaseRequest(`/campaigns?id=eq.${encodeURIComponent(campaignId)}`, {
-    method: 'PATCH',
-    body: JSON.stringify({ status: 'finished', finished_at: new Date().toISOString(), sent_count: sent, failed_count: failed }),
-  })
+  await patchCampaign(campaignId, { status: 'finished', finished_at: new Date().toISOString(), sent_count: sent, failed_count: failed })
 }
 
 function normalizeQrCode(data) {
@@ -395,8 +492,11 @@ async function handleApi(req, res, url) {
   }
 
   if (url.pathname === '/api/campaigns' && req.method === 'GET') {
-    const result = await supabaseRequest('/campaigns?select=id,name,niche,city,template_id,status,quantity_requested,daily_limit,sent_count,failed_count,delay_min_s,delay_max_s,started_at,finished_at,created_at&order=created_at.desc')
-    return sendJson(res, result.status, result.data)
+    let result = await supabaseRequest('/campaigns?select=id,name,niche,city,template_id,status,quantity_requested,daily_limit,sent_count,failed_count,delay_min_s,delay_max_s,started_at,finished_at,created_at&order=created_at.desc')
+    if (!result.ok && isMissingColumn(result)) {
+      result = await supabaseRequest('/campaigns?select=id,name,niche,city,template_id,status,quantity_requested,daily_limit,delay_min_seconds,delay_max_seconds,started_at,finished_at,created_at&order=created_at.desc')
+    }
+    return sendJson(res, result.status, result.ok && Array.isArray(result.data) ? result.data.map(normalizeCampaignRecord) : result.data)
   }
 
   if (url.pathname === '/api/campaigns' && req.method === 'POST') {
@@ -404,21 +504,30 @@ async function handleApi(req, res, url) {
     if (!body.name || !body.niche || !body.city) {
       return sendJson(res, 400, { message: 'name, niche e city sao obrigatorios.' })
     }
-    const result = await supabaseRequest('/campaigns', {
+    const payload = {
+      name: body.name,
+      niche: body.niche,
+      city: body.city,
+      template_id: body.template_id || null,
+      quantity_requested: Number(body.quantity_requested || body.quantity || 50),
+      daily_limit: Number(body.daily_limit || 50),
+      delay_min_s: Number(body.delay_min_s || 30),
+      delay_max_s: Number(body.delay_max_s || 90),
+      status: 'draft',
+    }
+
+    let result = await supabaseRequest('/campaigns', {
       method: 'POST',
-      body: JSON.stringify({
-        name: body.name,
-        niche: body.niche,
-        city: body.city,
-        template_id: body.template_id || null,
-        quantity_requested: Number(body.quantity_requested || body.quantity || 50),
-        daily_limit: Number(body.daily_limit || 50),
-        delay_min_s: Number(body.delay_min_s || 30),
-        delay_max_s: Number(body.delay_max_s || 90),
-        status: 'draft',
-      }),
+      body: JSON.stringify(payload),
     })
-    return sendJson(res, result.status, result.data?.[0] || result.data)
+    if (!result.ok && isMissingColumn(result)) {
+      result = await supabaseRequest('/campaigns', {
+        method: 'POST',
+        body: JSON.stringify(campaignPatchPayload(payload, true)),
+      })
+    }
+    const campaign = result.data?.[0] || result.data
+    return sendJson(res, result.status, result.ok ? normalizeCampaignRecord(campaign) : campaign)
   }
 
   if (url.pathname === '/api/leads' && req.method === 'GET') {
@@ -440,19 +549,16 @@ async function handleApi(req, res, url) {
     const body = await readBody(req)
     if (!body.name) return sendJson(res, 400, { message: 'name obrigatorio.' })
     const phone = normalizePhone(body.phone)
-    const result = await supabaseRequest('/leads', {
-      method: 'POST',
-      body: JSON.stringify({
-        name: body.name,
-        phone: body.phone || null,
-        normalized_phone: phone || null,
-        niche: body.niche || null,
-        city: body.city || null,
-        address: body.address || null,
-        website: body.website || null,
-        source: body.source || 'manual',
-        status: body.status || 'new',
-      }),
+    const result = await insertLeadRecord({
+      name: body.name,
+      phone: body.phone || null,
+      normalized_phone: phone || null,
+      niche: body.niche || null,
+      city: body.city || null,
+      address: body.address || null,
+      website: body.website || null,
+      source: body.source || 'manual',
+      status: body.status || 'new',
     })
     return sendJson(res, result.status, result.data?.[0] || result.data)
   }
@@ -732,20 +838,23 @@ async function handleApi(req, res, url) {
   const campaignStatusMatch = url.pathname.match(/^\/api\/campaigns\/([^/]+)\/status$/)
   if (campaignStatusMatch && req.method === 'GET') {
     const campaignId = campaignStatusMatch[1]
-    const [campRes, leadsRes] = await Promise.all([
-      supabaseRequest(`/campaigns?id=eq.${encodeURIComponent(campaignId)}&select=id,name,status,sent_count,failed_count,quantity_requested&limit=1`),
-      supabaseRequest(`/campaign_leads?campaign_id=eq.${encodeURIComponent(campaignId)}&select=status`),
-    ])
+    let campRes = await supabaseRequest(`/campaigns?id=eq.${encodeURIComponent(campaignId)}&select=id,name,status,sent_count,failed_count,quantity_requested&limit=1`)
+    if (!campRes.ok && isMissingColumn(campRes)) {
+      campRes = await supabaseRequest(`/campaigns?id=eq.${encodeURIComponent(campaignId)}&select=id,name,status,quantity_requested&limit=1`)
+    }
+    const rows = await campaignQueueRows(campaignId)
     if (!campRes.ok) return sendJson(res, campRes.status, campRes.data)
-    const campaign = campRes.data?.[0]
-    if (!campaign) return sendJson(res, 404, { message: 'Campanha nao encontrada.' })
-    const rows = leadsRes.data || []
+    const campaignRow = campRes.data?.[0]
+    if (!campaignRow) return sendJson(res, 404, { message: 'Campanha nao encontrada.' })
+    const campaign = normalizeCampaignRecord(campaignRow)
+    const sent = rows.filter(r => r.status === 'sent').length || campaign.sent_count
+    const failed = rows.filter(r => r.status === 'failed').length || campaign.failed_count
     return sendJson(res, 200, {
       ...campaign,
       total: rows.length,
       pending: rows.filter(r => r.status === 'pending').length,
-      sent: rows.filter(r => r.status === 'sent').length,
-      failed: rows.filter(r => r.status === 'failed').length,
+      sent,
+      failed,
     })
   }
 
@@ -753,10 +862,14 @@ async function handleApi(req, res, url) {
   if (campaignRunMatch && req.method === 'POST') {
     const campaignId = campaignRunMatch[1]
 
-    const campRes = await supabaseRequest(`/campaigns?id=eq.${encodeURIComponent(campaignId)}&select=id,name,niche,city,template_id,status,quantity_requested,daily_limit,delay_min_s,delay_max_s&limit=1`)
+    let campRes = await supabaseRequest(`/campaigns?id=eq.${encodeURIComponent(campaignId)}&select=id,name,niche,city,template_id,status,quantity_requested,daily_limit,delay_min_s,delay_max_s&limit=1`)
+    if (!campRes.ok && isMissingColumn(campRes)) {
+      campRes = await supabaseRequest(`/campaigns?id=eq.${encodeURIComponent(campaignId)}&select=id,name,niche,city,template_id,status,quantity_requested,daily_limit,delay_min_seconds,delay_max_seconds&limit=1`)
+    }
     if (!campRes.ok) return sendJson(res, campRes.status, campRes.data)
-    const campaign = campRes.data?.[0]
-    if (!campaign) return sendJson(res, 404, { message: 'Campanha nao encontrada.' })
+    const campaignRow = campRes.data?.[0]
+    if (!campaignRow) return sendJson(res, 404, { message: 'Campanha nao encontrada.' })
+    const campaign = normalizeCampaignRecord(campaignRow)
     if (campaign.status === 'running') return sendJson(res, 409, { message: 'Campanha ja esta rodando.' })
 
     const instance = await findDefaultOpenInstance()
@@ -808,20 +921,154 @@ async function handleApi(req, res, url) {
         }
       })
 
-    await supabaseRequest(`/campaigns?id=eq.${encodeURIComponent(campaignId)}`, {
-      method: 'PATCH',
-      body: JSON.stringify({ status: 'running', started_at: new Date().toISOString(), sent_count: 0, failed_count: 0 }),
-    })
+    await patchCampaign(campaignId, { status: 'running', started_at: new Date().toISOString(), sent_count: 0, failed_count: 0 })
 
     sendJson(res, 202, { message: 'Campanha iniciada.', total: overpassLeads.length, instance: instance.evolution_instance_name })
 
     runCampaignBackground(campaignId, campaign, overpassLeads, templateBody, instance).catch(() => {
-      supabaseRequest(`/campaigns?id=eq.${encodeURIComponent(campaignId)}`, {
-        method: 'PATCH',
-        body: JSON.stringify({ status: 'error' }),
-      })
+      patchCampaign(campaignId, { status: 'error' })
     })
     return
+  }
+
+  const campaignTestSendMatch = url.pathname.match(/^\/api\/campaigns\/([^/]+)\/send-test$/)
+  if (campaignTestSendMatch && req.method === 'POST') {
+    const campaignId = campaignTestSendMatch[1]
+    const body = await readBody(req)
+    const number = normalizePhone(body.number)
+    if (!number) return sendJson(res, 400, { message: 'number obrigatorio.' })
+    if (!/^\d{10,15}$/.test(number)) {
+      return sendJson(res, 400, { message: 'Numero invalido. Use DDI + DDD + numero, exemplo: 5531999999999.' })
+    }
+
+    let campRes = await supabaseRequest(`/campaigns?id=eq.${encodeURIComponent(campaignId)}&select=id,name,niche,city,template_id,status,quantity_requested,daily_limit,delay_min_s,delay_max_s&limit=1`)
+    if (!campRes.ok && isMissingColumn(campRes)) {
+      campRes = await supabaseRequest(`/campaigns?id=eq.${encodeURIComponent(campaignId)}&select=id,name,niche,city,template_id,status,quantity_requested,daily_limit,delay_min_seconds,delay_max_seconds&limit=1`)
+    }
+    if (!campRes.ok) return sendJson(res, campRes.status, campRes.data)
+    const campaignRow = campRes.data?.[0]
+    if (!campaignRow) return sendJson(res, 404, { message: 'Campanha nao encontrada.' })
+    const campaign = normalizeCampaignRecord(campaignRow)
+
+    const instance = body.instanceName
+      ? await findWhatsappInstance(body.instanceName)
+      : await findDefaultOpenInstance()
+    if (!instance?.evolution_instance_name) {
+      return sendJson(res, 409, { message: 'Nenhuma instancia WhatsApp aberta encontrada.' })
+    }
+
+    let templateBody = body.text || null
+    if (!templateBody && campaign.template_id) {
+      const tplRes = await supabaseRequest(`/message_templates?id=eq.${encodeURIComponent(campaign.template_id)}&select=body&limit=1`)
+      templateBody = tplRes.data?.[0]?.body || null
+    }
+    if (!templateBody) return sendJson(res, 400, { message: 'Template nao configurado na campanha.' })
+
+    const leadName = body.name || 'Usuario teste'
+    let lead = await findLeadByPhone(number)
+    if (!lead) {
+      const leadRes = await insertLeadRecord({
+        name: leadName,
+        phone: number,
+        normalized_phone: number,
+        niche: campaign.niche,
+        city: campaign.city,
+        source: 'manual',
+        status: 'new',
+      })
+      if (!leadRes.ok) return sendJson(res, leadRes.status, leadRes.data)
+      lead = leadRes.data?.[0] || null
+    }
+
+    const text = interpolate(templateBody, {
+      nome_empresa: leadName,
+      cidade: campaign.city,
+      nicho: campaign.niche,
+      servico: campaign.niche,
+    })
+
+    let clId = null
+    const clRes = await createCampaignLead({
+      campaign_id: campaignId,
+      lead_id: lead?.id || null,
+      status: 'pending',
+      scheduled_at: new Date().toISOString(),
+    })
+    if (clRes.ok) clId = clRes.data?.[0]?.id || null
+    if (!clId) clId = (await findCampaignLead(campaignId, lead?.id))?.id || null
+
+    await patchCampaign(campaignId, { status: 'running', started_at: new Date().toISOString(), sent_count: 0, failed_count: 0 })
+
+    const pendingMessage = await insertMessage({
+      lead_id: lead?.id || null,
+      whatsapp_instance_id: instance.id,
+      campaign_id: campaignId,
+      direction: 'outbound',
+      kind: 'text',
+      phone: number,
+      body: text,
+      status: 'pending',
+      raw_payload: { instanceName: instance.evolution_instance_name, source: 'campaign-test' },
+    })
+
+    const result = await evolutionRequest(`/message/sendText/${encodeURIComponent(instance.evolution_instance_name)}`, {
+      method: 'POST',
+      body: JSON.stringify({ number, text }),
+    })
+
+    const ok = result.ok
+    const providerMessageId =
+      result.data?.key?.id ||
+      result.data?.message?.key?.id ||
+      result.data?.id ||
+      null
+
+    if (pendingMessage?.id) {
+      await supabaseRequest(`/messages?id=eq.${encodeURIComponent(pendingMessage.id)}`, {
+        method: 'PATCH',
+        body: JSON.stringify({
+          status: ok ? 'sent' : 'failed',
+          provider_message_id: providerMessageId,
+          error_message: ok ? null : result.data?.message || result.data?.error || 'Falha no envio',
+          raw_payload: result.data || {},
+          sent_at: ok ? new Date().toISOString() : null,
+        }),
+      })
+    }
+
+    await updateCampaignLead(clId, {
+      status: ok ? 'sent' : 'failed',
+      message_id: pendingMessage?.id || null,
+      sent_at: new Date().toISOString(),
+      error: ok ? null : result.data?.message || result.data?.error || 'Falha no envio',
+    })
+
+    await patchCampaign(campaignId, {
+      status: ok ? 'finished' : 'error',
+      finished_at: new Date().toISOString(),
+      sent_count: ok ? 1 : 0,
+      failed_count: ok ? 0 : 1,
+    })
+    if (ok) {
+      await incrementInstanceSentToday(instance.id, instance.sent_today)
+      if (lead?.id) {
+        await supabaseRequest(`/leads?id=eq.${encodeURIComponent(lead.id)}`, {
+          method: 'PATCH',
+          body: JSON.stringify({ status: 'sent', last_interaction_at: new Date().toISOString() }),
+        })
+      }
+    }
+
+    if (!ok) return sendJson(res, result.status, result.data)
+    return sendJson(res, 200, {
+      message: 'Mensagem de teste enviada.',
+      campaignId,
+      leadId: lead?.id || null,
+      messageId: pendingMessage?.id || null,
+      instance: instance.evolution_instance_name,
+      number,
+      text,
+    })
   }
 
   if (url.pathname === '/api/search/leads' && req.method === 'GET') {

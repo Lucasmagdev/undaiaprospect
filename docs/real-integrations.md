@@ -7,6 +7,7 @@ O backend concentra as chaves sensiveis e expoe uma camada local para o frontend
 1. Crie um projeto no Supabase.
 2. Abra o SQL Editor.
 3. Execute o arquivo `supabase/schema.sql`.
+   - Em projetos ja existentes, execute tambem `supabase/migrations/20260429_align_mvp_contract.sql`.
 4. Copie `Project URL` e `service_role key`.
 5. Configure no `.env` local ou no ambiente da VPS:
 
@@ -79,6 +80,6 @@ No desenvolvimento local, use um tunel HTTPS quando precisar testar webhooks ext
 ## Ainda Mockado Ou Parcial
 
 - Banco por nicho e sequencias de automacao ainda ficam em memoria no frontend.
-- Google Places ainda nao esta integrado.
+- Google Places ainda nao esta integrado; o MVP usa Overpass/OSM para descoberta real de leads.
 - A fila real com delay 30-60s, limite diario e retomada de campanha ainda precisa de worker.
 - Autenticacao de usuarios/SaaS ainda nao foi adicionada.
