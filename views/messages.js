@@ -301,7 +301,26 @@ function openNewSequenceModal(root) {
   })
 }
 
+const TEMPLATE_SUGESTOES = [
+  {
+    label: 'Primeiro contato (permissao)',
+    text: 'Oi, tudo bem?\n\nVi que voces trabalham com {nicho} aqui em {cidade} e queria bater um papo rapido.\n\nTenho algo que pode ajudar no dia a dia do negocio. Posso te contar em dois minutinhos?',
+  },
+  {
+    label: 'Abordagem direta',
+    text: 'Ola! Como vai?\n\nEntrei em contato porque trabalho com solucoes para {nicho} e vi que voces sao de {cidade}.\n\nPosso compartilhar algo rapido com voce?',
+  },
+  {
+    label: 'Tom curioso',
+    text: 'Oi! Passei pelo perfil de voces e fiquei curioso.\n\nVoces sao da area de {nicho} em {cidade}, certo? Tenho algo que acho que vai fazer sentido pro negocio de voces.\n\nPosso mandar mais detalhes?',
+  },
+]
+
 function openNewTemplateModal(root) {
+  const sugestoesHtml = TEMPLATE_SUGESTOES.map((s, i) =>
+    `<button type="button" class="secondary" style="font-size:11px;padding:4px 8px" data-sug="${i}">${s.label}</button>`
+  ).join(' ')
+
   openModal({
     title: 'Novo template',
     submitLabel: 'Salvar template',
@@ -309,22 +328,34 @@ function openNewTemplateModal(root) {
       <div style="display:grid;gap:12px">
         <label style="display:grid;gap:5px;font-size:.78rem;font-weight:600;color:var(--text-2)">
           Nome
-          <input id="t-name" placeholder="ex: Follow-up D+3" />
+          <input id="t-name" placeholder="ex: Primeiro contato — {nicho}" />
         </label>
         <label style="display:grid;gap:5px;font-size:.78rem;font-weight:600;color:var(--text-2)">
           Uso
-          <input id="t-use" placeholder="ex: Sem resposta, Lead respondeu..." />
+          <input id="t-use" placeholder="ex: Primeiro contato frio" />
         </label>
         <label style="display:grid;gap:5px;font-size:.78rem;font-weight:600;color:var(--text-2)">
           Mensagem
-          <textarea id="t-body" rows="4" style="width:100%;border:1px solid var(--border-strong);border-radius:10px;padding:10px 12px;font:inherit;font-size:.875rem;outline:none;resize:vertical" placeholder="Use {nome_empresa}, {cidade}, {nicho}..."></textarea>
+          <p style="font-size:11px;color:var(--text-3);margin:0 0 4px">
+            Variaveis: <code>{cidade}</code> <code>{nicho}</code> — evite usar o nome da empresa no inicio, soa robotico.
+          </p>
+          <div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:6px">${sugestoesHtml}</div>
+          <textarea id="t-body" rows="5" style="width:100%;border:1px solid var(--border-strong);border-radius:10px;padding:10px 12px;font:inherit;font-size:.875rem;outline:none;resize:vertical" placeholder="Escreva sua mensagem aqui..."></textarea>
         </label>
       </div>
     `,
-    onSubmit: async (body) => {
-      const name = body.querySelector('#t-name').value.trim()
-      const use  = body.querySelector('#t-use').value.trim()
-      const text = body.querySelector('#t-body').value.trim()
+    onMount: (bodyEl) => {
+      bodyEl.querySelectorAll('[data-sug]').forEach(btn => {
+        btn.addEventListener('click', () => {
+          const sug = TEMPLATE_SUGESTOES[Number(btn.dataset.sug)]
+          if (sug) bodyEl.querySelector('#t-body').value = sug.text
+        })
+      })
+    },
+    onSubmit: async (bodyEl) => {
+      const name = bodyEl.querySelector('#t-name').value.trim()
+      const use  = bodyEl.querySelector('#t-use').value.trim()
+      const text = bodyEl.querySelector('#t-body').value.trim()
       if (!name || !use || !text) { toast('Preencha todos os campos.', 'warning'); throw new Error('validation') }
       const t = await TemplateService.create({ name, use, body: text, conversion: '—' })
       _templates.push(t)

@@ -532,6 +532,24 @@ const NICHE_TAGS = {
   imobiliaria:   [['shop', 'estate_agent'], ['office', 'estate_agent']],
 }
 
+// CNAEs por nicho — mesmos códigos do scripts/import-cnpj.mjs
+const CNAE_MAP = {
+  restaurante:   ['5611201', '5611203', '5611204', '5611205', '5612100'],
+  odontologia:   ['8630504'],
+  academia:      ['9313100'],
+  advocacia:     ['6911701'],
+  contabilidade: ['6920601', '6920602'],
+  estetica:      ['9602501', '9602502', '9602503'],
+  imobiliaria:   ['6810201', '6810202', '6821801', '6821802', '6822600'],
+}
+
+// Normaliza nome de cidade para bater com o formato da Receita Federal (maiúsculas, sem acento)
+function normalizeCity(city) {
+  return String(city || '')
+    .normalize('NFD').replace(/[̀-ͯ]/g, '')
+    .toUpperCase().trim()
+}
+
 // Termos de busca em português para Foursquare/scrapers
 const NICHE_TERMS = {
   restaurante:   'restaurante',
@@ -689,6 +707,42 @@ async function fetchFoursquareLeads(niche, city, limit) {
     lon: p.geocodes?.main?.longitude || null,
     source: 'foursquare',
   }))
+}
+
+async function fetchCNPJLeads(niche, city, limit) {
+  const cnaes = CNAE_MAP[niche]
+  if (!cnaes?.length) return []
+
+  const cityNorm = normalizeCity(city)
+  // PostgREST: IN operator para múltiplos CNAEs
+  const cnaeIn = cnaes.join(',')
+  const params = [
+    'select=cnpj,nome_fantasia,cnae_principal,municipio_nome,uf,ddd1,telefone1,ddd2,telefone2,email',
+    `municipio_nome=eq.${encodeURIComponent(cityNorm)}`,
+    `cnae_principal=in.(${cnaeIn})`,
+    'telefone1=neq.',
+    'order=cnpj.asc',
+    `limit=${limit}`,
+  ]
+
+  const result = await supabaseRequest(`/cnpj_empresas?${params.join('&')}`)
+  if (!result.ok || !Array.isArray(result.data)) return []
+
+  return result.data.map(e => {
+    const rawPhone = (e.ddd1 || '') + (e.telefone1 || '')
+    const rawPhone2 = (e.ddd2 || e.ddd1 || '') + (e.telefone2 || '')
+    const phone = normalizePhone(rawPhone) || normalizePhone(rawPhone2) || null
+    return {
+      name: e.nome_fantasia || e.cnpj || '',
+      phone,
+      address: e.uf ? `${e.municipio_nome}, ${e.uf}` : e.municipio_nome || null,
+      website: null,
+      email: e.email || null,
+      niche,
+      city: e.municipio_nome || city,
+      source: 'cnpj',
+    }
+  })
 }
 
 async function checkWhatsAppNumbers(instanceName, phones) {
@@ -1307,30 +1361,34 @@ async function handleApi(req, res, url) {
 
     if (!niche || !city) return sendJson(res, 400, { message: 'niche e city sao obrigatorios.' })
 
-    const [overpassSettled, fsqSettled, guiamaisSettled, apontadorSettled] = await Promise.allSettled([
+    const [overpassSettled, fsqSettled, guiamaisSettled, apontadorSettled, cnpjSettled] = await Promise.allSettled([
       fetchOverpassLeads(niche, city, limit),
       fetchFoursquareLeads(niche, city, limit),
       fetchGuiaMaisLeads(niche, city, limit),
       fetchApontadorLeads(niche, city, limit),
+      fetchCNPJLeads(niche, city, limit),
     ])
 
     const overpassLeads  = overpassSettled.status  === 'fulfilled' ? overpassSettled.value  : []
     const fsqLeads       = fsqSettled.status       === 'fulfilled' ? fsqSettled.value       : []
     const guiamaisLeads  = guiamaisSettled.status  === 'fulfilled' ? guiamaisSettled.value  : []
     const apontadorLeads = apontadorSettled.status === 'fulfilled' ? apontadorSettled.value : []
+    const cnpjLeads      = cnpjSettled.status      === 'fulfilled' ? cnpjSettled.value      : []
 
-    const all = [...overpassLeads, ...fsqLeads, ...guiamaisLeads, ...apontadorLeads]
+    const all = [...overpassLeads, ...fsqLeads, ...guiamaisLeads, ...apontadorLeads, ...cnpjLeads]
     if (!all.length) {
       return sendJson(res, 502, { message: 'Nenhuma fonte retornou resultados. Tente novamente em instantes.' })
     }
 
     // Merge: deduplica por telefone normalizado.
-    // Prioridade: foursquare > guiamais > apontador > overpass (mais confiáveis no final da lista sobrescrevem)
+    // Prioridade (quem sobrescreve): cnpj > guiamais > apontador > foursquare > overpass
+    const PRIORITY = { cnpj: 5, guiamais: 4, apontador: 3, foursquare: 2, overpass: 1 }
     const phoneMap = new Map()
     const noPhoneLeads = []
-    for (const lead of [...overpassLeads, ...fsqLeads, ...guiamaisLeads, ...apontadorLeads]) {
+    for (const lead of all) {
       if (!lead.phone) { noPhoneLeads.push(lead); continue }
-      if (!phoneMap.has(lead.phone) || ['foursquare', 'guiamais', 'apontador'].includes(lead.source)) {
+      const existing = phoneMap.get(lead.phone)
+      if (!existing || (PRIORITY[lead.source] || 0) > (PRIORITY[existing.source] || 0)) {
         phoneMap.set(lead.phone, lead)
       }
     }

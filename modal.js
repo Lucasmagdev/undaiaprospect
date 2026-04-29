@@ -1,4 +1,4 @@
-export function openModal({ title, body, submitLabel = 'Confirmar', onSubmit, onCancel } = {}) {
+export function openModal({ title, body, submitLabel = 'Confirmar', onSubmit, onCancel, onMount } = {}) {
   const overlay = document.createElement('div')
   overlay.className = 'modal-overlay'
   overlay.innerHTML = `
@@ -20,7 +20,10 @@ export function openModal({ title, body, submitLabel = 'Confirmar', onSubmit, on
   document.body.appendChild(overlay)
 
   requestAnimationFrame(() => {
-    requestAnimationFrame(() => overlay.classList.add('modal-visible'))
+    requestAnimationFrame(() => {
+      overlay.classList.add('modal-visible')
+      onMount?.(overlay.querySelector('.modal-body'))
+    })
   })
 
   const close = () => {

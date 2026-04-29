@@ -40,10 +40,11 @@ function phoneTypeBadge(type) {
 
 function sourceBadge(source) {
   const map = {
-    overpass:    'OSM',
-    foursquare:  '4sq',
-    guiamais:    'GuiaMais',
-    apontador:   'Apontador',
+    overpass:      'OSM',
+    foursquare:    '4sq',
+    guiamais:      'GuiaMais',
+    apontador:     'Apontador',
+    cnpj:          'Receita Federal',
     google_places: 'Google',
   }
   return `<span class="badge-neutral" style="font-size:10px">${map[source] || source}</span>`
@@ -93,7 +94,7 @@ export function render() {
     <article class="panel prospect-panel">
       <div class="panel-head">
         <h2>Prospectar leads</h2>
-        <span class="badge-neutral">OSM + Foursquare + Guia Mais + Apontador</span>
+        <span class="badge-neutral">OSM · Foursquare · GuiaMais · Apontador · Receita Federal</span>
       </div>
       <form class="prospect-form" autocomplete="off">
         <label>Nicho
