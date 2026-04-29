@@ -222,20 +222,62 @@ function openSendDirectModal() {
         </label>
         <label style="display:flex;align-items:center;gap:8px;font-size:.78rem;font-weight:600;color:var(--text-2);cursor:pointer">
           <input id="d-audio" type="checkbox" checked style="width:15px;height:15px" />
-          Enviar como áudio de voz (Kokoro TTS)
+          Enviar como áudio de voz
+        </label>
+        <label style="display:grid;gap:5px;font-size:.78rem;font-weight:600;color:var(--text-2)" id="d-speed-wrap">Velocidade da voz
+          <div style="display:flex;align-items:center;gap:10px">
+            <input id="d-speed" type="range" min="0.6" max="1.2" step="0.05" value="0.85" style="flex:1" />
+            <span id="d-speed-label" style="min-width:50px;font-size:.85rem;color:var(--text-1)">0.85×</span>
+          </div>
+          <div style="display:flex;justify-content:space-between;font-size:10px;color:var(--text-3)"><span>Lento</span><span>Normal</span><span>Rápido</span></div>
+        </label>
+        <label style="display:grid;gap:5px;font-size:.78rem;font-weight:600;color:var(--text-2)" id="d-engine-wrap">Motor de voz
+          <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px">
+            <label style="display:flex;align-items:center;gap:8px;padding:10px 12px;border:2px solid var(--primary);border-radius:8px;cursor:pointer;font-weight:500" id="d-opt-piper">
+              <input type="radio" name="d-engine" value="piper" checked style="accent-color:var(--primary)" />
+              <span>🎙 Piper TTS<br><small style="font-weight:400;color:var(--text-3)">Voz natural pt-BR</small></span>
+            </label>
+            <label style="display:flex;align-items:center;gap:8px;padding:10px 12px;border:1px solid var(--border);border-radius:8px;cursor:pointer;font-weight:500" id="d-opt-kokoro">
+              <input type="radio" name="d-engine" value="kokoro" style="accent-color:var(--primary)" />
+              <span>🤖 Kokoro TTS<br><small style="font-weight:400;color:var(--text-3)">Leve e rápido</small></span>
+            </label>
+          </div>
         </label>
       </div>
+      <script>
+        (function(){
+          const cb = document.getElementById('d-audio');
+          const engineWrap = document.getElementById('d-engine-wrap');
+          const speedWrap  = document.getElementById('d-speed-wrap');
+          const slider     = document.getElementById('d-speed');
+          const speedLabel = document.getElementById('d-speed-label');
+          slider.addEventListener('input', () => { speedLabel.textContent = parseFloat(slider.value).toFixed(2) + '×'; });
+          const toggle = () => {
+            const on = cb.checked;
+            [engineWrap, speedWrap].forEach(w => { w.style.opacity = on ? '1' : '0.4'; w.style.pointerEvents = on ? '' : 'none'; });
+          };
+          cb.addEventListener('change', toggle); toggle();
+          document.querySelectorAll('input[name="d-engine"]').forEach(r => {
+            r.addEventListener('change', () => {
+              document.getElementById('d-opt-piper').style.borderColor  = r.value === 'piper'  ? 'var(--primary)' : 'var(--border)';
+              document.getElementById('d-opt-kokoro').style.borderColor = r.value === 'kokoro' ? 'var(--primary)' : 'var(--border)';
+            });
+          });
+        })();
+      </script>
     `,
     onSubmit: async (body) => {
       const raw     = body.querySelector('#d-numbers').value
       const text    = body.querySelector('#d-text').value.trim()
       const audio   = body.querySelector('#d-audio').checked
+      const engine  = body.querySelector('input[name="d-engine"]:checked')?.value || 'piper'
+      const speed   = parseFloat(body.querySelector('#d-speed')?.value || '0.85')
       const numbers = raw.split(/[\n,;]+/).map(n => n.replace(/\D/g, '').trim()).filter(n => n.length >= 10)
 
       if (!numbers.length) { toast('Informe ao menos um número válido.', 'warning'); throw new Error('validation') }
       if (!text) { toast('Mensagem obrigatória.', 'warning'); throw new Error('validation') }
 
-      const data = await WhatsAppInstanceService.sendDirect({ numbers, text, use_audio: audio })
+      const data = await WhatsAppInstanceService.sendDirect({ numbers, text, use_audio: audio, engine, speed })
       toast(`Enviado para ${data.sent} número(s)${data.failed ? ` · ${data.failed} falha(s)` : ''} ✓`, data.failed ? 'warning' : 'success')
     },
   })

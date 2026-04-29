@@ -425,14 +425,14 @@ function interpolate(template, vars) {
   return template.replace(/\{([^}]+)\}/g, (_, key) => vars[key] || `{${key}}`)
 }
 
-async function generateSpeech(text) {
-  // Kokoro TTS (self-hosted) — prioridade
+async function generateSpeech(text, engine = 'piper', speed = 0.85) {
+  // Kokoro/Piper TTS (self-hosted) — prioridade
   if (TTS_SERVER_URL) {
     try {
       const response = await fetch(`${TTS_SERVER_URL}/synthesize`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ text, voice: TTS_VOICE, language: 'pt-br' }),
+        body: JSON.stringify({ text, engine, speed, language: 'pt-br' }),
         signal: AbortSignal.timeout(30_000),
       })
       if (response.ok) {
@@ -1480,6 +1480,8 @@ async function handleApi(req, res, url) {
     const numbers = (body.numbers || []).map(n => String(n).replace(/\D/g, '')).filter(n => /^\d{10,15}$/.test(n))
     const text = String(body.text || '').trim()
     const useAudio = Boolean(body.use_audio)
+    const engine = ['piper', 'kokoro'].includes(body.engine) ? body.engine : 'piper'
+    const speed  = Math.min(Math.max(Number(body.speed) || 0.85, 0.5), 1.5)
 
     if (!numbers.length) return sendJson(res, 400, { message: 'Nenhum numero valido informado.' })
     if (!text) return sendJson(res, 400, { message: 'text obrigatorio.' })
@@ -1490,7 +1492,7 @@ async function handleApi(req, res, url) {
     }
 
     let audioBase64 = null
-    if (useAudio) audioBase64 = await generateSpeech(text)
+    if (useAudio) audioBase64 = await generateSpeech(text, engine, speed)
 
     let sent = 0, failed = 0
     for (const number of numbers) {

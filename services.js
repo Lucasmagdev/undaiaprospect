@@ -446,10 +446,10 @@ export const WhatsAppInstanceService = {
     return apiFetch('/api/whatsapp/messages')
   },
 
-  async sendDirect({ numbers, text, use_audio }) {
+  async sendDirect({ numbers, text, use_audio, engine, speed }) {
     return apiFetch('/api/whatsapp/send-direct', {
       method: 'POST',
-      body: JSON.stringify({ numbers, text, use_audio }),
+      body: JSON.stringify({ numbers, text, use_audio, engine, speed }),
     })
   },
 }
