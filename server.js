@@ -23,13 +23,19 @@ const EVOLUTION_API_KEY = process.env.EVOLUTION_API_KEY || ''
 const SUPABASE_URL = (process.env.SUPABASE_URL || '').replace(/\/$/, '')
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || ''
 const FOURSQUARE_API_KEY = process.env.FOURSQUARE_API_KEY || ''
+const ELEVENLABS_API_KEY = process.env.ELEVENLABS_API_KEY || ''
+const ELEVENLABS_VOICE_ID = process.env.ELEVENLABS_VOICE_ID || ''
+const TTS_SERVER_URL = (process.env.TTS_SERVER_URL || '').replace(/\/$/, '')
+const TTS_VOICE = process.env.TTS_VOICE || 'pf_dora'
 
 const ALLOWED_ORIGINS = new Set([
   process.env.CORS_ORIGIN || 'http://127.0.0.1:5173',
   'http://127.0.0.1:5173',
   'http://127.0.0.1:5174',
+  'http://127.0.0.1:5175',
   'http://localhost:5173',
   'http://localhost:5174',
+  'http://localhost:5175',
 ])
 
 function _sendJson(res, status, data, reqOrigin) {
@@ -342,6 +348,9 @@ async function listApprovedCampaignLeads(campaign) {
     'order=created_at.asc',
     `limit=${Math.min(requested * 3, 300)}`,
   ]
+  if (campaign.neighborhood) {
+    params.push(`address=ilike.*${encodeURIComponent(campaign.neighborhood)}*`)
+  }
   const result = await supabaseRequest(`/leads?${params.join('&')}`)
   if (!result.ok || !Array.isArray(result.data)) return []
 
@@ -416,6 +425,50 @@ function interpolate(template, vars) {
   return template.replace(/\{([^}]+)\}/g, (_, key) => vars[key] || `{${key}}`)
 }
 
+async function generateSpeech(text) {
+  // Kokoro TTS (self-hosted) — prioridade
+  if (TTS_SERVER_URL) {
+    try {
+      const response = await fetch(`${TTS_SERVER_URL}/synthesize`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ text, voice: TTS_VOICE, language: 'pt-br' }),
+        signal: AbortSignal.timeout(30_000),
+      })
+      if (response.ok) {
+        const data = await response.json()
+        if (data.audio_base64) return data.audio_base64
+      }
+    } catch { /* fallback para ElevenLabs */ }
+  }
+
+  // ElevenLabs fallback
+  if (!ELEVENLABS_API_KEY || !ELEVENLABS_VOICE_ID) return null
+  const response = await fetch(`https://api.elevenlabs.io/v1/text-to-speech/${ELEVENLABS_VOICE_ID}`, {
+    method: 'POST',
+    headers: {
+      'xi-api-key': ELEVENLABS_API_KEY,
+      'Content-Type': 'application/json',
+      'Accept': 'audio/mpeg',
+    },
+    body: JSON.stringify({
+      text,
+      model_id: 'eleven_turbo_v2_5',
+      voice_settings: { stability: 0.4, similarity_boost: 0.85, style: 0.2 },
+    }),
+  })
+  if (!response.ok) return null
+  const arrayBuffer = await response.arrayBuffer()
+  return Buffer.from(arrayBuffer).toString('base64')
+}
+
+async function sendAudioPTT(instanceName, phone, audioBase64) {
+  return evolutionRequest(`/message/sendWhatsAppAudio/${encodeURIComponent(instanceName)}`, {
+    method: 'POST',
+    body: JSON.stringify({ number: phone, audio: audioBase64, encoding: true }),
+  })
+}
+
 async function runCampaignBackground(campaignId, campaign, leads, templateBody, instance) {
   let sent = 0
   let failed = 0
@@ -456,22 +509,39 @@ async function runCampaignBackground(campaignId, campaign, leads, templateBody, 
     const clRes = await createCampaignLead({ campaign_id: campaignId, lead_id: leadRecord?.id || null, status: 'pending', scheduled_at: new Date().toISOString() })
     const clId = clRes.data?.[0]?.id
 
+    const useAudio = campaign.use_audio && ELEVENLABS_API_KEY && ELEVENLABS_VOICE_ID
+    const msgKind = useAudio ? 'audio' : 'text'
+
     const msgRecord = await insertMessage({
       lead_id: leadRecord?.id || null,
       whatsapp_instance_id: instance.id,
       campaign_id: campaignId,
       direction: 'outbound',
-      kind: 'text',
+      kind: msgKind,
       phone: lead.phone,
       body,
       status: 'pending',
       raw_payload: { instanceName: instance.evolution_instance_name, source: 'campaign' },
     })
 
-    const result = await evolutionRequest(`/message/sendText/${encodeURIComponent(instance.evolution_instance_name)}`, {
-      method: 'POST',
-      body: JSON.stringify({ number: lead.phone, text: body }),
-    })
+    let result
+    if (useAudio) {
+      const audioBase64 = await generateSpeech(body)
+      if (audioBase64) {
+        result = await sendAudioPTT(instance.evolution_instance_name, lead.phone, audioBase64)
+      } else {
+        // ElevenLabs falhou — fallback para texto
+        result = await evolutionRequest(`/message/sendText/${encodeURIComponent(instance.evolution_instance_name)}`, {
+          method: 'POST',
+          body: JSON.stringify({ number: lead.phone, text: body }),
+        })
+      }
+    } else {
+      result = await evolutionRequest(`/message/sendText/${encodeURIComponent(instance.evolution_instance_name)}`, {
+        method: 'POST',
+        body: JSON.stringify({ number: lead.phone, text: body }),
+      })
+    }
 
     const ok = result.ok
     sent += ok ? 1 : 0
@@ -787,7 +857,7 @@ async function handleApi(req, res, url) {
   }
 
   if (url.pathname === '/api/campaigns' && req.method === 'GET') {
-    let result = await supabaseRequest('/campaigns?select=id,name,niche,city,template_id,status,quantity_requested,daily_limit,sent_count,failed_count,delay_min_s,delay_max_s,started_at,finished_at,created_at&order=created_at.desc')
+    let result = await supabaseRequest('/campaigns?select=id,name,niche,city,neighborhood,use_audio,template_id,status,quantity_requested,daily_limit,sent_count,failed_count,delay_min_s,delay_max_s,started_at,finished_at,created_at&order=created_at.desc')
     if (!result.ok && isMissingColumn(result)) {
       result = await supabaseRequest('/campaigns?select=id,name,niche,city,template_id,status,quantity_requested,daily_limit,delay_min_seconds,delay_max_seconds,started_at,finished_at,created_at&order=created_at.desc')
     }
@@ -803,6 +873,8 @@ async function handleApi(req, res, url) {
       name: body.name,
       niche: body.niche,
       city: body.city,
+      neighborhood: body.neighborhood || null,
+      use_audio: Boolean(body.use_audio),
       template_id: body.template_id || null,
       quantity_requested: Number(body.quantity_requested || body.quantity || 50),
       daily_limit: Number(body.daily_limit || 50),
@@ -1401,6 +1473,41 @@ async function handleApi(req, res, url) {
       .slice(0, limit)
 
     return sendJson(res, 200, results)
+  }
+
+  if (url.pathname === '/api/whatsapp/send-direct' && req.method === 'POST') {
+    const body = await readBody(req)
+    const numbers = (body.numbers || []).map(n => String(n).replace(/\D/g, '')).filter(n => /^\d{10,15}$/.test(n))
+    const text = String(body.text || '').trim()
+    const useAudio = Boolean(body.use_audio)
+
+    if (!numbers.length) return sendJson(res, 400, { message: 'Nenhum numero valido informado.' })
+    if (!text) return sendJson(res, 400, { message: 'text obrigatorio.' })
+
+    const instance = await findDefaultOpenInstance()
+    if (!instance?.evolution_instance_name) {
+      return sendJson(res, 409, { message: 'Nenhuma instancia WhatsApp aberta encontrada.' })
+    }
+
+    let audioBase64 = null
+    if (useAudio) audioBase64 = await generateSpeech(text)
+
+    let sent = 0, failed = 0
+    for (const number of numbers) {
+      let result
+      if (audioBase64) {
+        result = await sendAudioPTT(instance.evolution_instance_name, number, audioBase64)
+      } else {
+        result = await evolutionRequest(`/message/sendText/${encodeURIComponent(instance.evolution_instance_name)}`, {
+          method: 'POST',
+          body: JSON.stringify({ number, text }),
+        })
+      }
+      if (result.ok) { sent++; await incrementInstanceSentToday(instance.id, instance.sent_today + sent - 1) }
+      else failed++
+    }
+
+    return sendJson(res, 200, { sent, failed, total: numbers.length })
   }
 
   return sendJson(res, 404, { message: 'Rota nao encontrada.' })

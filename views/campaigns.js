@@ -1,7 +1,7 @@
 import { badge, progress, skeletonTable, emptyState } from '../components.js'
 import { openModal } from '../modal.js'
 import { toast } from '../toast.js'
-import { CampaignService, TemplateService } from '../services.js'
+import { CampaignService, TemplateService, WhatsAppInstanceService } from '../services.js'
 
 const NICHOS = ['restaurante', 'odontologia', 'academia', 'advocacia', 'contabilidade', 'estetica', 'imobiliaria']
 
@@ -24,7 +24,10 @@ export function render() {
         <p class="eyebrow">Centro de controle</p>
         <h1>Campanhas</h1>
       </div>
-      <button class="primary" id="new-campaign-btn">${plusIcon} Nova campanha</button>
+      <div style="display:flex;gap:8px">
+        <button class="secondary" id="send-direct-btn" style="background:var(--surface-2);border:1px solid var(--border);border-radius:8px;padding:8px 16px;cursor:pointer;font-size:.85rem;color:var(--text-1);display:flex;align-items:center;gap:6px">${micIcon} Enviar para número(s)</button>
+        <button class="primary" id="new-campaign-btn">${plusIcon} Nova campanha</button>
+      </div>
     </section>
     <section class="table-card" id="campaigns-table">
       ${skeletonTable(3, 7)}
@@ -34,6 +37,7 @@ export function render() {
 
 export async function setup(root) {
   root.querySelector('#new-campaign-btn').addEventListener('click', () => openNewCampaignModal(root))
+  root.querySelector('#send-direct-btn').addEventListener('click', () => openSendDirectModal())
   await loadTable(root)
 }
 
@@ -157,8 +161,16 @@ async function openNewCampaignModal(root) {
         <label style="display:grid;gap:5px;font-size:.78rem;font-weight:600;color:var(--text-2)">Cidade
           <input id="m-city" placeholder="ex: Belo Horizonte" value="Belo Horizonte" />
         </label>
+        <label style="display:grid;gap:5px;font-size:.78rem;font-weight:600;color:var(--text-2)">Bairro <span style="font-weight:400;color:var(--text-3)">(opcional)</span>
+          <input id="m-neighborhood" placeholder="ex: Savassi, Centro, Lourdes" />
+        </label>
         <label style="display:grid;gap:5px;font-size:.78rem;font-weight:600;color:var(--text-2)">Template de mensagem (D+0)
           <select id="m-template">${templateOptions}</select>
+        </label>
+        <label style="display:flex;align-items:center;gap:8px;font-size:.78rem;font-weight:600;color:var(--text-2);cursor:pointer">
+          <input id="m-use-audio" type="checkbox" style="width:15px;height:15px" />
+          Enviar como áudio de voz (Kokoro TTS)
+          <span style="font-weight:400;color:var(--text-3)">— usa TTS_SERVER_URL do .env</span>
         </label>
         <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px">
           <label style="display:grid;gap:5px;font-size:.78rem;font-weight:600;color:var(--text-2)">Leads alvo
@@ -178,6 +190,8 @@ async function openNewCampaignModal(root) {
       const name  = body.querySelector('#m-name').value.trim()
       const niche = body.querySelector('#m-niche').value
       const city  = body.querySelector('#m-city').value.trim()
+      const neighborhood = body.querySelector('#m-neighborhood').value.trim() || null
+      const use_audio = body.querySelector('#m-use-audio').checked
       const template_id = body.querySelector('#m-template').value || null
       const quantity_requested = Number(body.querySelector('#m-qty').value || 50)
       const delay_min_s = Number(body.querySelector('#m-dmin').value || 30)
@@ -186,11 +200,46 @@ async function openNewCampaignModal(root) {
       if (!name || !city) { toast('Nome e cidade obrigatórios.', 'warning'); throw new Error('validation') }
       if (!template_id) { toast('Selecione um template.', 'warning'); throw new Error('validation') }
 
-      await CampaignService.create({ name, niche, city, template_id, quantity_requested, delay_min_s, delay_max_s })
+      await CampaignService.create({ name, niche, city, neighborhood, use_audio, template_id, quantity_requested, delay_min_s, delay_max_s })
       toast(`Campanha "${name}" criada. Clique em Disparar para iniciar.`, 'success')
       await loadTable(root)
     },
   })
 }
 
+function openSendDirectModal() {
+  openModal({
+    title: 'Enviar para número(s)',
+    submitLabel: 'Enviar',
+    body: `
+      <div style="display:grid;gap:14px">
+        <label style="display:grid;gap:5px;font-size:.78rem;font-weight:600;color:var(--text-2)">Números WhatsApp
+          <textarea id="d-numbers" rows="3" placeholder="Um por linha ou separados por vírgula&#10;5531988887777&#10;5511999998888" style="resize:vertical;font-family:monospace;font-size:.85rem"></textarea>
+          <span style="font-size:11px;color:var(--text-3)">Formato: DDI+DDD+número (ex: 5531988887777)</span>
+        </label>
+        <label style="display:grid;gap:5px;font-size:.78rem;font-weight:600;color:var(--text-2)">Mensagem
+          <textarea id="d-text" rows="4" placeholder="Digite a mensagem de voz..." style="resize:vertical"></textarea>
+        </label>
+        <label style="display:flex;align-items:center;gap:8px;font-size:.78rem;font-weight:600;color:var(--text-2);cursor:pointer">
+          <input id="d-audio" type="checkbox" checked style="width:15px;height:15px" />
+          Enviar como áudio de voz (Kokoro TTS)
+        </label>
+      </div>
+    `,
+    onSubmit: async (body) => {
+      const raw     = body.querySelector('#d-numbers').value
+      const text    = body.querySelector('#d-text').value.trim()
+      const audio   = body.querySelector('#d-audio').checked
+      const numbers = raw.split(/[\n,;]+/).map(n => n.replace(/\D/g, '').trim()).filter(n => n.length >= 10)
+
+      if (!numbers.length) { toast('Informe ao menos um número válido.', 'warning'); throw new Error('validation') }
+      if (!text) { toast('Mensagem obrigatória.', 'warning'); throw new Error('validation') }
+
+      const data = await WhatsAppInstanceService.sendDirect({ numbers, text, use_audio: audio })
+      toast(`Enviado para ${data.sent} número(s)${data.failed ? ` · ${data.failed} falha(s)` : ''} ✓`, data.failed ? 'warning' : 'success')
+    },
+  })
+}
+
 const plusIcon = `<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14"/><path d="M12 5v14"/></svg>`
+const micIcon  = `<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="2" width="6" height="11" rx="3"/><path d="M19 10a7 7 0 0 1-14 0"/><line x1="12" y1="19" x2="12" y2="22"/><line x1="8" y1="22" x2="16" y2="22"/></svg>`

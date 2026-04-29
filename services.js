@@ -188,6 +188,7 @@ export const CampaignService = {
       status: campaign.status,
       status_label: campaignStatusLabel(campaign.status),
       progress: 0,
+      neighborhood: campaign.neighborhood || null,
       quantity_requested: Number(campaign.quantity_requested || 0),
       sent_count: Number(campaign.sent_count || 0),
       failed_count: Number(campaign.failed_count || 0),
@@ -443,5 +444,12 @@ export const WhatsAppInstanceService = {
 
   async listMessages() {
     return apiFetch('/api/whatsapp/messages')
+  },
+
+  async sendDirect({ numbers, text, use_audio }) {
+    return apiFetch('/api/whatsapp/send-direct', {
+      method: 'POST',
+      body: JSON.stringify({ numbers, text, use_audio }),
+    })
   },
 }
