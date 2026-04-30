@@ -941,9 +941,10 @@ const NICHE_CONTEXT = {
   imobiliaria:   'imobiliárias e corretores — dores comuns: gestão de visitas, follow-up de clientes, controle de documentação',
 }
 
-function buildSdrSystemPrompt(lead) {
+function buildSdrSystemPrompt(lead, originalMessage = '') {
   const nicheCtx = NICHE_CONTEXT[lead.niche] || `negócios de ${lead.niche || 'varejo'}`
-  return `Você é um assistente de pré-vendas de uma empresa de tecnologia que desenvolve sistemas e automações sob medida para pequenos e médios negócios. Entregamos em até 1 semana.
+  const ctxMsg = originalMessage ? `\nMensagem que enviamos antes para esse lead:\n"${originalMessage}"\n` : ''
+  return `Você é um assistente de pré-vendas de uma empresa de tecnologia que desenvolve sistemas e automações sob medida para pequenos e médios negócios. Entregamos em até 1 semana.${ctxMsg}
 
 Contexto do lead:
 - Empresa: ${lead.lead_name || 'empresa'}
@@ -1075,10 +1076,37 @@ ${history}`
 // Motor principal do agente SDR
 // ─────────────────────────────────────────────────────────────────────────────
 
+const DEFAULT_RESPONSE = 'Oi! Obrigado por entrar em contato 😊 No momento não consigo te atender por aqui, mas em breve alguém do nosso time vai responder!'
+
+async function findOutboundMessage(phone) {
+  const result = await supabaseRequest(
+    `/messages?phone=eq.${encodeURIComponent(phone)}&direction=eq.outbound&order=created_at.desc&limit=1`
+  )
+  return result.ok && Array.isArray(result.data) && result.data.length ? result.data[0] : null
+}
+
+async function sendWhatsAppText(instanceName, phone, text) {
+  return evolutionRequest(`/message/sendText/${encodeURIComponent(instanceName)}`, {
+    method: 'POST',
+    body: JSON.stringify({ number: phone, text }),
+  })
+}
+
 async function runSdrAgent(phone, incomingText) {
   if (!GROQ_API_KEY) return
 
-  // Busca ou cria a conversa
+  const instance = await findDefaultOpenInstance()
+  if (!instance?.evolution_instance_name) return
+
+  // Verifica se esse número recebeu alguma mensagem nossa antes
+  const outboundMsg = await findOutboundMessage(phone)
+  if (!outboundMsg) {
+    // Número desconhecido — resposta padrão e encerra
+    await sendWhatsAppText(instance.evolution_instance_name, phone, DEFAULT_RESPONSE)
+    return
+  }
+
+  // Busca ou cria a conversa com contexto do lead
   let conv = await getConversation(phone)
   if (!conv) {
     const lead = await findLeadByPhone(phone)
@@ -1087,20 +1115,21 @@ async function runSdrAgent(phone, incomingText) {
   if (!conv) return
   if (!conv.agent_active) return
 
-  // Encerra automaticamente após 6 trocas para não spammar
+  // Encerra automaticamente após 6 trocas
   if (conv.exchanges >= 6) {
     await saveConversation(conv.id, { agent_active: false, status: 'finished' })
     return
   }
 
   const messages = Array.isArray(conv.messages) ? conv.messages : []
-  const systemPrompt = buildSdrSystemPrompt(conv)
+
+  // Monta system prompt com contexto da mensagem enviada
+  const systemPrompt = buildSdrSystemPrompt(conv, outboundMsg.body)
 
   // Adiciona mensagem do lead ao histórico
   const ts = new Date().toISOString()
   messages.push({ role: 'user', content: incomingText, ts })
 
-  // Monta o payload para o Groq
   const groqMessages = [
     { role: 'system', content: systemPrompt },
     ...messages.map(m => ({ role: m.role, content: m.content })),
@@ -1114,31 +1143,24 @@ async function runSdrAgent(phone, incomingText) {
     return
   }
 
-  // Adiciona resposta do agente ao histórico
   messages.push({ role: 'assistant', content: reply, ts: new Date().toISOString() })
 
-  // Scoring assíncrono (não bloqueia o envio da resposta)
   const scoreResult = await scoreLead({ ...conv, messages })
   const isHot = scoreResult.score >= HOT_LEAD_SCORE
 
   await saveConversation(conv.id, {
     messages,
-    exchanges:      conv.exchanges + 1,
-    score:          scoreResult.score,
-    score_reason:   scoreResult.reason,
-    status:         isHot ? 'hot' : scoreResult.status,
-    agent_active:   scoreResult.status !== 'opt_out' && scoreResult.status !== 'finished',
+    exchanges:       conv.exchanges + 1,
+    score:           scoreResult.score,
+    score_reason:    scoreResult.reason,
+    status:          isHot ? 'hot' : scoreResult.status,
+    agent_active:    scoreResult.status !== 'opt_out' && scoreResult.status !== 'finished',
     last_message_at: ts,
   })
 
-  // Envia a resposta pelo WhatsApp
-  const instance = await findDefaultOpenInstance()
-  if (instance?.evolution_instance_name) {
-    await evolutionRequest(`/message/sendText/${encodeURIComponent(instance.evolution_instance_name)}`, {
-      method: 'POST',
-      body: JSON.stringify({ number: phone, text: reply }),
-    })
-  }
+  console.log(`[SDR] ${phone} | score:${scoreResult.score} | status:${scoreResult.status} | "${reply.slice(0, 60)}..."`)
+
+  await sendWhatsAppText(instance.evolution_instance_name, phone, reply)
 }
 
 async function handleApi(req, res, url) {
