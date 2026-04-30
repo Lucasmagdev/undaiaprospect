@@ -1148,8 +1148,12 @@ td strong { color: var(--text-1); font-weight: 600; }
 
 .modal {
   background: var(--surface);
-  border-radius: var(--radius-xl);
-  width: min(480px, 100%);
+  border-radius: var(--radius-lg);
+  width: min(720px, 100%);
+  max-height: calc(100vh - 32px);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
   box-shadow: 0 24px 64px rgb(0 0 0 / 0.18);
   transform: scale(0.95) translateY(10px);
   transition: transform 220ms cubic-bezier(0.34, 1.56, 0.64, 1);
@@ -1186,6 +1190,8 @@ td strong { color: var(--text-1); font-weight: 600; }
 
 .modal-body {
   padding: 20px;
+  overflow-y: auto;
+  min-height: 0;
 }
 
 .modal-footer {
@@ -1194,6 +1200,119 @@ td strong { color: var(--text-1); font-weight: 600; }
   gap: 10px;
   padding: 16px 20px;
   border-top: 1px solid var(--border);
+  background: var(--surface);
+  flex-shrink: 0;
+}
+
+.direct-send-form {
+  display: grid;
+  gap: 14px;
+}
+
+.direct-send-form textarea,
+.direct-send-form select,
+.direct-send-form input[type="text"],
+.direct-send-form input[type="number"] {
+  width: 100%;
+  min-width: 0;
+}
+
+.direct-preset-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 8px;
+  align-items: center;
+}
+
+.tts-preview-panel {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 12px;
+  border: 1px solid var(--green-border);
+  border-radius: var(--radius);
+  background: var(--green-bg);
+}
+
+.tts-preview-panel div {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+}
+
+.tts-preview-panel strong {
+  color: var(--green-700);
+  font-size: 0.82rem;
+  font-weight: 800;
+}
+
+.tts-preview-panel span {
+  color: var(--text-3);
+  font-size: 0.76rem;
+  line-height: 1.35;
+}
+
+.tts-preview-btn {
+  min-height: 36px;
+  padding: 0 14px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--green-600);
+  background: var(--surface);
+  color: var(--green-700);
+  font-size: 0.8rem;
+  font-weight: 800;
+  white-space: nowrap;
+  transition: background var(--t), color var(--t), border-color var(--t);
+}
+
+.tts-preview-btn:hover:not(:disabled) {
+  background: var(--green-600);
+  color: #fff;
+}
+
+@media (max-width: 700px) {
+  .modal-overlay {
+    align-items: flex-start;
+    padding: 8px;
+    overflow-y: auto;
+  }
+
+  .modal {
+    width: 100%;
+    max-height: calc(100vh - 16px);
+  }
+
+  .modal-head,
+  .modal-body,
+  .modal-footer {
+    padding-left: 14px;
+    padding-right: 14px;
+  }
+
+  .direct-send-form [style*="grid-template-columns"] {
+    grid-template-columns: 1fr !important;
+  }
+
+  .direct-send-form [style*="display:flex;gap:8px"],
+  .direct-send-form [style*="display:flex;gap:8px;align-items:center"] {
+    flex-wrap: wrap;
+  }
+
+  .tts-preview-panel {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .tts-preview-btn,
+  .modal-footer .primary,
+  .modal-footer .secondary {
+    width: 100%;
+  }
+
+  .modal-footer {
+    flex-direction: column-reverse;
+  }
 }
 
 /* ── SKELETON ── */

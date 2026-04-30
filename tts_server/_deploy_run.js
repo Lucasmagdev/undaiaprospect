@@ -1,6 +1,8 @@
-const { Client } = require('ssh2');
-const fs = require('fs');
-const path = require('path');
+import { Client } from 'ssh2';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 const CONFIG = {
   host: '177.7.38.137',
@@ -62,16 +64,41 @@ async function deploy() {
   sftp.end();
 
   // Setup ambiente
-  console.log('\n==> Instalando python3-venv e dependências...');
+  console.log('\n==> Instalando dependências do sistema...');
   await run(conn, `
-    apt-get install -y python3-venv python3-pip 2>&1 | tail -5
+    apt-get install -y python3-venv python3-pip ffmpeg 2>&1 | tail -5
   `);
+
+  console.log('\n==> Criando venv e instalando dependências Python...');
   await run(conn, `
     cd ${REMOTE_DIR} &&
     python3 -m venv venv &&
     source venv/bin/activate &&
-    pip install -q --upgrade pip &&
+    pip install -q --upgrade pip
+  `);
+
+  // PyTorch CPU deve ser instalado ANTES do Coqui TTS para evitar download da versão CUDA (~5GB)
+  console.log('\n==> Instalando PyTorch CPU (necessário para XTTS v2)...');
+  await run(conn, `
+    cd ${REMOTE_DIR} &&
+    source venv/bin/activate &&
+    pip install -q torch torchaudio --index-url https://download.pytorch.org/whl/cpu
+  `);
+
+  console.log('\n==> Instalando requirements.txt...');
+  await run(conn, `
+    cd ${REMOTE_DIR} &&
+    source venv/bin/activate &&
     pip install -q -r requirements.txt
+  `);
+
+  // Coqui TTS oficial não suporta Python 3.12 — usa fork da comunidade (idiap)
+  // API idêntica: from TTS.api import TTS
+  console.log('\n==> Instalando XTTS v2 via fork idiap/coqui-ai-TTS (Python 3.12)...');
+  await run(conn, `
+    cd ${REMOTE_DIR} &&
+    source venv/bin/activate &&
+    pip install -q git+https://github.com/idiap/coqui-ai-TTS
   `);
 
   // Baixar modelos Kokoro

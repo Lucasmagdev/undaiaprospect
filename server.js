@@ -131,6 +131,16 @@ async function supabaseRequest(path, options = {}) {
   return { ok: response.ok, status: response.status, data }
 }
 
+async function readJsonResponse(response) {
+  const text = await response.text()
+  if (!text) return {}
+  try {
+    return JSON.parse(text)
+  } catch {
+    return { raw: text }
+  }
+}
+
 function normalizePhone(value) {
   const raw = String(value || '')
   const candidates = raw
@@ -425,41 +435,99 @@ function interpolate(template, vars) {
   return template.replace(/\{([^}]+)\}/g, (_, key) => vars[key] || `{${key}}`)
 }
 
-async function generateSpeech(text, engine = 'piper', speed = 0.85) {
-  // Kokoro/Piper TTS (self-hosted) — prioridade
+function speechErrorMessage(error) {
+  const message = String(error?.message || error || '')
+  if (message.includes('aborted') || message.includes('timeout') || error?.name === 'TimeoutError') {
+    return 'Tempo limite ao gerar audio no servidor TTS.'
+  }
+  return message || 'Falha desconhecida no servidor TTS.'
+}
+
+async function generateSpeechResult(text, engine = 'edge', speed = 0.85, voice = '', ttsExtra = {}) {
+  let ttsError = null
+
+  // TTS self-hosted (VPS)
   if (TTS_SERVER_URL) {
-    try {
+    const requestTts = async (payload) => {
       const response = await fetch(`${TTS_SERVER_URL}/synthesize`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ text, engine, speed, language: 'pt-br' }),
-        signal: AbortSignal.timeout(30_000),
+        body: JSON.stringify(payload),
+        signal: AbortSignal.timeout(Number(process.env.TTS_TIMEOUT_MS || 60_000)),
       })
-      if (response.ok) {
-        const data = await response.json()
-        if (data.audio_base64) return data.audio_base64
+      const data = await readJsonResponse(response)
+      if (response.ok && data.audio_base64) {
+        return {
+          audioBase64: data.audio_base64,
+          format: data.format || 'wav',
+          engine: data.engine || payload.engine,
+          requestedEngine: engine,
+        }
       }
-    } catch { /* fallback para ElevenLabs */ }
+      throw new Error(data.detail || data.message || data.raw || 'TTS nao retornou audio.')
+    }
+
+    try {
+      return await requestTts({ text, engine, speed, voice, language: 'pt-br', ...ttsExtra })
+    } catch (error) {
+      ttsError = error
+      if (engine !== 'kokoro') {
+        try {
+          return await requestTts({ text, engine: 'kokoro', speed, voice: TTS_VOICE, language: 'pt-br', ...ttsExtra })
+        } catch (fallbackError) {
+          ttsError = fallbackError
+        }
+      }
+    }
   }
 
   // ElevenLabs fallback
-  if (!ELEVENLABS_API_KEY || !ELEVENLABS_VOICE_ID) return null
-  const response = await fetch(`https://api.elevenlabs.io/v1/text-to-speech/${ELEVENLABS_VOICE_ID}`, {
-    method: 'POST',
-    headers: {
-      'xi-api-key': ELEVENLABS_API_KEY,
-      'Content-Type': 'application/json',
-      'Accept': 'audio/mpeg',
-    },
-    body: JSON.stringify({
-      text,
-      model_id: 'eleven_turbo_v2_5',
-      voice_settings: { stability: 0.4, similarity_boost: 0.85, style: 0.2 },
-    }),
-  })
-  if (!response.ok) return null
-  const arrayBuffer = await response.arrayBuffer()
-  return Buffer.from(arrayBuffer).toString('base64')
+  if (ELEVENLABS_API_KEY && ELEVENLABS_VOICE_ID) {
+    try {
+      const response = await fetch(`https://api.elevenlabs.io/v1/text-to-speech/${ELEVENLABS_VOICE_ID}`, {
+        method: 'POST',
+        headers: {
+          'xi-api-key': ELEVENLABS_API_KEY,
+          'Content-Type': 'application/json',
+          'Accept': 'audio/mpeg',
+        },
+        body: JSON.stringify({
+          text,
+          model_id: 'eleven_turbo_v2_5',
+          voice_settings: { stability: 0.4, similarity_boost: 0.85, style: 0.2 },
+        }),
+        signal: AbortSignal.timeout(Number(process.env.TTS_TIMEOUT_MS || 60_000)),
+      })
+      if (response.ok) {
+        const arrayBuffer = await response.arrayBuffer()
+        return {
+          audioBase64: Buffer.from(arrayBuffer).toString('base64'),
+          format: 'mp3',
+          engine: 'elevenlabs',
+          requestedEngine: engine,
+        }
+      }
+      const data = await readJsonResponse(response)
+      ttsError = new Error(data.detail || data.message || data.raw || 'ElevenLabs nao retornou audio.')
+    } catch (error) {
+      ttsError = error
+    }
+  }
+
+  return {
+    audioBase64: null,
+    format: null,
+    engine,
+    requestedEngine: engine,
+    error: TTS_SERVER_URL || ELEVENLABS_API_KEY
+      ? speechErrorMessage(ttsError)
+      : 'TTS_SERVER_URL ou ELEVENLABS_API_KEY/ELEVENLABS_VOICE_ID nao configurados.',
+  }
+}
+
+async function generateSpeech(text, engine = 'edge', speed = 0.85, voice = '', ttsExtra = {}) {
+  const result = await generateSpeechResult(text, engine, speed, voice, ttsExtra)
+  return result.audioBase64
 }
 
 async function sendAudioPTT(instanceName, phone, audioBase64) {
@@ -1475,24 +1543,92 @@ async function handleApi(req, res, url) {
     return sendJson(res, 200, results)
   }
 
+  if (url.pathname.replace(/\/+$/, '') === '/api/tts/preview' && req.method === 'POST') {
+    const body    = await readBody(req)
+    const text    = String(body.text || '').trim()
+    const engine  = ['piper', 'kokoro', 'edge', 'xtts'].includes(body.engine) ? body.engine : 'edge'
+    const speed   = Math.min(Math.max(Number(body.speed) || 1.0, 0.5), 1.5)
+    const voice   = engine === 'edge' ? String(body.voice || '') : ''
+    const extra   = {
+      style:       String(body.style       || 'chat'),
+      styledegree: Math.min(Math.max(Number(body.styledegree) || 1.5, 0.01), 2.0),
+      pitch_pct:   Math.min(Math.max(Number(body.pitch_pct)   || -3,  -50),  50),
+      character:   String(body.character   || 'casual'),
+      prefix:      String(body.prefix      || ''),
+      suffix:      String(body.suffix      || ''),
+      humanize_audio: Boolean(body.humanize_audio),
+    }
+    if (!text) return sendJson(res, 400, { message: 'text obrigatorio.' })
+    try {
+      const speech = await generateSpeechResult(text, engine, speed, voice, extra)
+      if (!speech.audioBase64) {
+        return sendJson(res, 502, { message: speech.error || 'TTS nao retornou audio para o preview.' })
+      }
+      return sendJson(res, 200, {
+        audio_base64: speech.audioBase64,
+        format: speech.format,
+        engine: speech.engine,
+        requested_engine: speech.requestedEngine || engine,
+      })
+    } catch (e) {
+      return sendJson(res, 500, { message: String(e.message || e) })
+    }
+  }
+
   if (url.pathname === '/api/whatsapp/send-direct' && req.method === 'POST') {
     const body = await readBody(req)
     const numbers = (body.numbers || []).map(n => String(n).replace(/\D/g, '')).filter(n => /^\d{10,15}$/.test(n))
     const text = String(body.text || '').trim()
     const useAudio = Boolean(body.use_audio)
-    const engine = ['piper', 'kokoro'].includes(body.engine) ? body.engine : 'piper'
+    const dryRun = Boolean(body.dry_run)
+    const engine = ['piper', 'kokoro', 'edge', 'xtts'].includes(body.engine) ? body.engine : 'edge'
     const speed  = Math.min(Math.max(Number(body.speed) || 0.85, 0.5), 1.5)
+    const voice  = engine === 'edge' ? String(body.voice || '') : ''
+    const extra  = {
+      style:       String(body.style       || 'chat'),
+      styledegree: Math.min(Math.max(Number(body.styledegree) || 1.5, 0.01), 2.0),
+      pitch_pct:   Math.min(Math.max(Number(body.pitch_pct)   || -3,  -50),  50),
+      character:   String(body.character   || 'casual'),
+      prefix:      String(body.prefix      || ''),
+      suffix:      String(body.suffix      || ''),
+      humanize_audio: Boolean(body.humanize_audio),
+    }
 
     if (!numbers.length) return sendJson(res, 400, { message: 'Nenhum numero valido informado.' })
     if (!text) return sendJson(res, 400, { message: 'text obrigatorio.' })
+
+    let audioBase64 = null
+    let speech = null
+    if (useAudio) {
+      speech = await generateSpeechResult(text, engine, speed, voice, extra)
+      audioBase64 = speech.audioBase64
+      if (!audioBase64) {
+        return sendJson(res, 502, {
+          message: `Nao foi possivel gerar o audio. Nada foi enviado. ${speech.error || ''}`.trim(),
+          sent: 0,
+          failed: numbers.length,
+          total: numbers.length,
+        })
+      }
+    }
+
+    if (dryRun) {
+      return sendJson(res, 200, {
+        dry_run: true,
+        sent: 0,
+        failed: 0,
+        total: numbers.length,
+        audio_generated: Boolean(audioBase64),
+        audio_format: speech?.format || null,
+        engine: speech?.engine || engine,
+        requested_engine: speech?.requestedEngine || engine,
+      })
+    }
 
     const instance = await findDefaultOpenInstance()
     if (!instance?.evolution_instance_name) {
       return sendJson(res, 409, { message: 'Nenhuma instancia WhatsApp aberta encontrada.' })
     }
-
-    let audioBase64 = null
-    if (useAudio) audioBase64 = await generateSpeech(text, engine, speed)
 
     let sent = 0, failed = 0
     for (const number of numbers) {
@@ -1509,7 +1645,13 @@ async function handleApi(req, res, url) {
       else failed++
     }
 
-    return sendJson(res, 200, { sent, failed, total: numbers.length })
+    return sendJson(res, 200, {
+      sent,
+      failed,
+      total: numbers.length,
+      engine: speech?.engine || null,
+      requested_engine: speech?.requestedEngine || null,
+    })
   }
 
   return sendJson(res, 404, { message: 'Rota nao encontrada.' })

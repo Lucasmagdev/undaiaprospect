@@ -3,3 +3,7 @@ fastapi==0.111.0
 uvicorn==0.30.1
 pydantic==2.7.1
 numpy>=1.24
+edge-tts>=6.1.9
+# TTS (Coqui / XTTS v2) — instalado via deploy script com torch CPU first
+# pip install torch torchaudio --index-url https://download.pytorch.org/whl/cpu
+# pip install TTS>=0.22.0

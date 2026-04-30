@@ -377,15 +377,35 @@ export const SettingsService = {
 const API_BASE = import.meta.env.VITE_API_BASE || 'http://127.0.0.1:3001'
 
 async function apiFetch(path, options = {}) {
-  const response = await fetch(`${API_BASE}${path}`, {
-    ...options,
-    headers: {
-      'Content-Type': 'application/json',
-      ...(options.headers || {}),
-    },
-  })
+  const { timeoutMs = 60_000, ...fetchOptions } = options
+  const controller = new AbortController()
+  const timeout = setTimeout(() => controller.abort(), timeoutMs)
+  let response
+  try {
+    response = await fetch(`${API_BASE}${path}`, {
+      ...fetchOptions,
+      signal: fetchOptions.signal || controller.signal,
+      headers: {
+        'Content-Type': 'application/json',
+        ...(fetchOptions.headers || {}),
+      },
+    })
+  } catch (error) {
+    if (error?.name === 'AbortError') {
+      throw new Error('Tempo limite ao chamar a API local. Verifique se o backend/TTS esta respondendo.')
+    }
+    throw new Error('Nao consegui conectar na API local. Rode `npm run api` e tente novamente.')
+  } finally {
+    clearTimeout(timeout)
+  }
 
-  const data = await response.json().catch(() => ({}))
+  const raw = await response.text()
+  let data = {}
+  try {
+    data = raw ? JSON.parse(raw) : {}
+  } catch {
+    data = { message: raw || 'Resposta invalida da API.' }
+  }
   if (!response.ok) {
     throw new Error(data.message || data.error || 'Erro ao chamar API.')
   }
@@ -446,10 +466,19 @@ export const WhatsAppInstanceService = {
     return apiFetch('/api/whatsapp/messages')
   },
 
-  async sendDirect({ numbers, text, use_audio, engine, speed }) {
+  async sendDirect({ numbers, text, use_audio, engine, speed, voice = '', ...extra }) {
     return apiFetch('/api/whatsapp/send-direct', {
       method: 'POST',
-      body: JSON.stringify({ numbers, text, use_audio, engine, speed }),
+      body: JSON.stringify({ numbers, text, use_audio, engine, speed, voice, ...extra }),
+      timeoutMs: 120_000,
+    })
+  },
+
+  async previewTTS({ text, engine, speed, voice = '', ...extra }) {
+    return apiFetch('/api/tts/preview', {
+      method: 'POST',
+      body: JSON.stringify({ text, engine, speed, voice, ...extra }),
+      timeoutMs: 120_000,
     })
   },
 }
