@@ -27,6 +27,9 @@ const ELEVENLABS_API_KEY = process.env.ELEVENLABS_API_KEY || ''
 const ELEVENLABS_VOICE_ID = process.env.ELEVENLABS_VOICE_ID || ''
 const TTS_SERVER_URL = (process.env.TTS_SERVER_URL || '').replace(/\/$/, '')
 const TTS_VOICE = process.env.TTS_VOICE || 'pf_dora'
+const GROQ_API_KEY = process.env.GROQ_API_KEY || ''
+const HOT_LEAD_SCORE = Number(process.env.HOT_LEAD_SCORE || 70)
+const GROQ_MODEL = 'llama-3.1-70b-versatile'
 
 const ALLOWED_ORIGINS = new Set([
   process.env.CORS_ORIGIN || 'http://127.0.0.1:5173',
@@ -444,15 +447,13 @@ function speechErrorMessage(error) {
 }
 
 async function generateSpeechResult(text, engine = 'edge', speed = 0.85, voice = '', ttsExtra = {}) {
-  let ttsError = null
-
-  // TTS self-hosted (VPS)
+  // TTS self-hosted (VPS) — sem fallback: se o engine falhar, retorna erro direto
   if (TTS_SERVER_URL) {
-    const requestTts = async (payload) => {
+    try {
       const response = await fetch(`${TTS_SERVER_URL}/synthesize`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload),
+        body: JSON.stringify({ text, engine, speed, voice, language: 'pt-br', ...ttsExtra }),
         signal: AbortSignal.timeout(Number(process.env.TTS_TIMEOUT_MS || 60_000)),
       })
       const data = await readJsonResponse(response)
@@ -460,28 +461,29 @@ async function generateSpeechResult(text, engine = 'edge', speed = 0.85, voice =
         return {
           audioBase64: data.audio_base64,
           format: data.format || 'wav',
-          engine: data.engine || payload.engine,
+          engine: data.engine || engine,
           requestedEngine: engine,
         }
       }
-      throw new Error(data.detail || data.message || data.raw || 'TTS nao retornou audio.')
-    }
-
-    try {
-      return await requestTts({ text, engine, speed, voice, language: 'pt-br', ...ttsExtra })
+      return {
+        audioBase64: null,
+        format: null,
+        engine,
+        requestedEngine: engine,
+        error: speechErrorMessage({ message: data.detail || data.message || data.raw || `Engine "${engine}" nao retornou audio.` }),
+      }
     } catch (error) {
-      ttsError = error
-      if (engine !== 'kokoro') {
-        try {
-          return await requestTts({ text, engine: 'kokoro', speed, voice: TTS_VOICE, language: 'pt-br', ...ttsExtra })
-        } catch (fallbackError) {
-          ttsError = fallbackError
-        }
+      return {
+        audioBase64: null,
+        format: null,
+        engine,
+        requestedEngine: engine,
+        error: speechErrorMessage(error),
       }
     }
   }
 
-  // ElevenLabs fallback
+  // ElevenLabs — apenas se nenhum TTS self-hosted estiver configurado
   if (ELEVENLABS_API_KEY && ELEVENLABS_VOICE_ID) {
     try {
       const response = await fetch(`https://api.elevenlabs.io/v1/text-to-speech/${ELEVENLABS_VOICE_ID}`, {
@@ -508,9 +510,15 @@ async function generateSpeechResult(text, engine = 'edge', speed = 0.85, voice =
         }
       }
       const data = await readJsonResponse(response)
-      ttsError = new Error(data.detail || data.message || data.raw || 'ElevenLabs nao retornou audio.')
+      return {
+        audioBase64: null,
+        format: null,
+        engine,
+        requestedEngine: engine,
+        error: data.detail || data.message || data.raw || 'ElevenLabs nao retornou audio.',
+      }
     } catch (error) {
-      ttsError = error
+      return { audioBase64: null, format: null, engine, requestedEngine: engine, error: speechErrorMessage(error) }
     }
   }
 
@@ -519,9 +527,7 @@ async function generateSpeechResult(text, engine = 'edge', speed = 0.85, voice =
     format: null,
     engine,
     requestedEngine: engine,
-    error: TTS_SERVER_URL || ELEVENLABS_API_KEY
-      ? speechErrorMessage(ttsError)
-      : 'TTS_SERVER_URL ou ELEVENLABS_API_KEY/ELEVENLABS_VOICE_ID nao configurados.',
+    error: 'TTS_SERVER_URL ou ELEVENLABS_API_KEY/ELEVENLABS_VOICE_ID nao configurados.',
   }
 }
 
@@ -896,6 +902,245 @@ async function checkWhatsAppNumbers(instanceName, phones) {
   }
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// GROQ — LLM para agente SDR
+// ─────────────────────────────────────────────────────────────────────────────
+
+async function groqChat(messages, { temperature = 0.7, maxTokens = 300 } = {}) {
+  if (!GROQ_API_KEY) throw new Error('GROQ_API_KEY não configurada.')
+  const response = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Authorization': `Bearer ${GROQ_API_KEY}`,
+    },
+    body: JSON.stringify({
+      model: GROQ_MODEL,
+      messages,
+      temperature,
+      max_tokens: maxTokens,
+    }),
+    signal: AbortSignal.timeout(20_000),
+  })
+  const data = await readJsonResponse(response)
+  if (!response.ok) throw new Error(data?.error?.message || 'Groq retornou erro.')
+  return data.choices?.[0]?.message?.content?.trim() || ''
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// System prompt do agente SDR por nicho
+// ─────────────────────────────────────────────────────────────────────────────
+
+const NICHE_CONTEXT = {
+  restaurante:   'restaurantes e bares — dores comuns: controle de comanda, estoque, pedidos delivery, gestão de mesas',
+  odontologia:   'clínicas odontológicas — dores comuns: agendamento manual, prontuário em papel, controle de retornos',
+  academia:      'academias e estúdios fitness — dores comuns: controle de mensalidades, check-in manual, gestão de alunos',
+  advocacia:     'escritórios de advocacia — dores comuns: controle de prazos, gestão de documentos, cobrança de honorários',
+  contabilidade: 'escritórios de contabilidade — dores comuns: entrega de documentos por WhatsApp, controle de obrigações fiscais',
+  estetica:      'salões e clínicas de estética — dores comuns: agendamento manual, controle de retorno de clientes, estoque de produtos',
+  imobiliaria:   'imobiliárias e corretores — dores comuns: gestão de visitas, follow-up de clientes, controle de documentação',
+}
+
+function buildSdrSystemPrompt(lead) {
+  const nicheCtx = NICHE_CONTEXT[lead.niche] || `negócios de ${lead.niche || 'varejo'}`
+  return `Você é um assistente de pré-vendas de uma empresa de tecnologia que desenvolve sistemas e automações sob medida para pequenos e médios negócios. Entregamos em até 1 semana.
+
+Contexto do lead:
+- Empresa: ${lead.lead_name || 'empresa'}
+- Nicho: ${lead.niche || 'negócio local'} (${nicheCtx})
+- Cidade: ${lead.city || 'cidade não informada'}
+
+SEU ÚNICO OBJETIVO: descobrir o maior problema operacional desse negócio hoje. Nada de vender ainda — só entender.
+
+REGRAS:
+- Frases curtas, tom de WhatsApp, informal
+- Máximo 2 frases por resposta
+- Uma pergunta por vez
+- Nunca mencione preço, valor, plano ou prazo
+- Nunca diga que é uma IA ou bot
+
+COMO AGIR EM CADA SITUAÇÃO:
+
+[SITUAÇÃO 1 — Lead responde com curiosidade: "quem é você?", "como me achou?", "o que você faz?"]
+→ Seja direto e leve. Ex: "Oi! A gente desenvolve sistemas pra negócios como o seu aqui em ${lead.city || 'sua cidade'} 😊 Posso te fazer uma pergunta rápida?"
+
+[SITUAÇÃO 2 — Lead demonstra abertura: "pode falar", "o que você tem?", "me conta"]
+→ Faça a pergunta de descoberta de dor. Ex: "Que parte do dia a dia do ${lead.lead_name || 'negócio'} mais consome o seu tempo hoje?"
+
+[SITUAÇÃO 3 — Lead revela um problema claro]
+→ Valide a dor com empatia, diga que provavelmente tem solução e pergunte se pode mostrar. Ex: "Cara, isso é bem comum e tem como automatizar isso sim. Posso te mostrar como funciona numa conversa rápida?"
+
+[SITUAÇÃO 4 — Lead pergunta o preço antes de revelar o problema]
+→ Desvie gentilmente. Ex: "Depende muito do que você precisa — cada caso é diferente. Me conta primeiro qual é o maior problema que você tem hoje?"
+
+[SITUAÇÃO 5 — Lead diz que não é o decisor: "fala com meu sócio", "sou funcionário"]
+→ Peça o contato do decisor. Ex: "Sem problema! Como eu falo com a pessoa responsável? Posso mandar uma mensagem direta pra ela?"
+
+[SITUAÇÃO 6 — Lead demonstra urgência: "preciso disso logo", "tô com problema agora"]
+→ Acelere. Ex: "Entendi, isso a gente consegue resolver rápido. Me conta o que tá acontecendo?"
+
+[SITUAÇÃO 7 — Lead não tem interesse: "não quero", "não preciso", "para de me mandar"]
+→ Encerre sem insistir. Ex: "Tudo bem, desculpa o incômodo! Se um dia precisar, é só chamar 😊"
+
+[SITUAÇÃO 8 — Lead faz pergunta técnica: "que sistema é esse?", "é um app?", "funciona em celular?"]
+→ Responda de forma simples e redirecione para a dor. Ex: "A gente faz sob medida — pode ser app, sistema web, automação, depende do que você precisa. Mas antes me fala: qual é o maior gargalo que você tem hoje?"
+
+[SITUAÇÃO 9 — Lead está em dúvida, responde mas sem comprometimento]
+→ Faça uma pergunta mais específica sobre o nicho. Use o contexto: ${nicheCtx}
+
+[SITUAÇÃO 10 — Conversa travou ou lead parou de responder no meio]
+→ Envie uma mensagem leve de retomada: "Oi! Vi que a gente ficou no meio da conversa 😅 Ainda faz sentido eu te mostrar como funciona?"
+
+Responda APENAS com o texto da mensagem WhatsApp, sem explicações, sem colchetes, sem metadados.`
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Histórico de conversa — Supabase
+// ─────────────────────────────────────────────────────────────────────────────
+
+async function getConversation(phone) {
+  const result = await supabaseRequest(
+    `/conversations?phone=eq.${encodeURIComponent(phone)}&order=created_at.desc&limit=1`
+  )
+  if (result.ok && Array.isArray(result.data) && result.data.length) return result.data[0]
+  return null
+}
+
+async function createConversation(phone, lead = {}) {
+  const result = await supabaseRequest('/conversations', {
+    method: 'POST',
+    body: JSON.stringify({
+      phone,
+      lead_id:   lead.id   || null,
+      lead_name: lead.name || null,
+      niche:     lead.niche || null,
+      city:      lead.city  || null,
+      messages:  [],
+      score:     0,
+      status:    'active',
+      agent_active: true,
+      exchanges: 0,
+    }),
+  })
+  return result.ok ? result.data?.[0] : null
+}
+
+async function saveConversation(id, patch) {
+  await supabaseRequest(`/conversations?id=eq.${encodeURIComponent(id)}`, {
+    method: 'PATCH',
+    body: JSON.stringify(patch),
+  })
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Scoring de lead via Groq
+// ─────────────────────────────────────────────────────────────────────────────
+
+async function scoreLead(conversation) {
+  if (!GROQ_API_KEY) return { score: conversation.score || 0, reason: 'Groq não configurado' }
+  const history = (conversation.messages || [])
+    .map(m => `${m.role === 'user' ? 'Lead' : 'Agente'}: ${m.content}`)
+    .join('\n')
+
+  const prompt = `Analise essa conversa de prospecção e retorne APENAS um JSON válido, sem markdown, sem explicação:
+{"score": 0-100, "reason": "motivo em uma frase curta", "status": "active|hot|cold|opt_out"}
+
+Critérios de score:
+- 80-100: revelou problema específico E demonstrou interesse em ver solução
+- 60-79: revelou problema mas ainda não pediu solução
+- 40-59: respondeu mas sem revelar problema claro ainda
+- 20-39: respostas vagas ou frias
+- 0-19: não tem interesse ou pediu para parar
+
+Conversa:
+${history}`
+
+  try {
+    const raw = await groqChat(
+      [{ role: 'user', content: prompt }],
+      { temperature: 0.1, maxTokens: 80 }
+    )
+    const json = JSON.parse(raw.replace(/```json|```/g, '').trim())
+    return {
+      score:  Math.min(100, Math.max(0, Number(json.score) || 0)),
+      reason: String(json.reason || ''),
+      status: ['active', 'hot', 'cold', 'opt_out', 'finished'].includes(json.status) ? json.status : 'active',
+    }
+  } catch {
+    return { score: conversation.score || 0, reason: '', status: 'active' }
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Motor principal do agente SDR
+// ─────────────────────────────────────────────────────────────────────────────
+
+async function runSdrAgent(phone, incomingText) {
+  if (!GROQ_API_KEY) return
+
+  // Busca ou cria a conversa
+  let conv = await getConversation(phone)
+  if (!conv) {
+    const lead = await findLeadByPhone(phone)
+    conv = await createConversation(phone, lead || {})
+  }
+  if (!conv) return
+  if (!conv.agent_active) return
+
+  // Encerra automaticamente após 6 trocas para não spammar
+  if (conv.exchanges >= 6) {
+    await saveConversation(conv.id, { agent_active: false, status: 'finished' })
+    return
+  }
+
+  const messages = Array.isArray(conv.messages) ? conv.messages : []
+  const systemPrompt = buildSdrSystemPrompt(conv)
+
+  // Adiciona mensagem do lead ao histórico
+  const ts = new Date().toISOString()
+  messages.push({ role: 'user', content: incomingText, ts })
+
+  // Monta o payload para o Groq
+  const groqMessages = [
+    { role: 'system', content: systemPrompt },
+    ...messages.map(m => ({ role: m.role, content: m.content })),
+  ]
+
+  let reply = ''
+  try {
+    reply = await groqChat(groqMessages, { temperature: 0.75, maxTokens: 200 })
+  } catch (e) {
+    console.error('[SDR] Groq error:', e.message)
+    return
+  }
+
+  // Adiciona resposta do agente ao histórico
+  messages.push({ role: 'assistant', content: reply, ts: new Date().toISOString() })
+
+  // Scoring assíncrono (não bloqueia o envio da resposta)
+  const scoreResult = await scoreLead({ ...conv, messages })
+  const isHot = scoreResult.score >= HOT_LEAD_SCORE
+
+  await saveConversation(conv.id, {
+    messages,
+    exchanges:      conv.exchanges + 1,
+    score:          scoreResult.score,
+    score_reason:   scoreResult.reason,
+    status:         isHot ? 'hot' : scoreResult.status,
+    agent_active:   scoreResult.status !== 'opt_out' && scoreResult.status !== 'finished',
+    last_message_at: ts,
+  })
+
+  // Envia a resposta pelo WhatsApp
+  const instance = await findDefaultOpenInstance()
+  if (instance?.evolution_instance_name) {
+    await evolutionRequest(`/message/sendText/${encodeURIComponent(instance.evolution_instance_name)}`, {
+      method: 'POST',
+      body: JSON.stringify({ number: phone, text: reply }),
+    })
+  }
+}
+
 async function handleApi(req, res, url) {
   const reqOrigin = req.headers.origin || ''
   const sendJson = (r, s, d) => _sendJson(r, s, d, reqOrigin)
@@ -1130,9 +1375,32 @@ async function handleApi(req, res, url) {
   if (url.pathname === '/api/webhooks/evolution' && req.method === 'POST') {
     const body = await readBody(req)
     const event = body?.event || body?.type || ''
-    if (event.includes('messages') || event.includes('MESSAGES') || body?.data?.message || body?.message) {
+    const isMessage = event.includes('messages') || event.includes('MESSAGES') || body?.data?.message || body?.message
+
+    if (isMessage) {
       await saveInboundMessage(body)
+
+      // Aciona o agente SDR apenas para mensagens recebidas de leads (não de nós mesmos)
+      const key = body?.data?.key || body?.message?.key || {}
+      const isFromMe = key?.fromMe === true
+      const remoteJid = key?.remoteJid || body?.data?.remoteJid || ''
+      const isGroup = remoteJid.includes('@g.us')
+
+      if (!isFromMe && !isGroup) {
+        const phone = normalizePhone(remoteJid.replace(/@.*/, ''))
+        const text =
+          body?.data?.message?.conversation ||
+          body?.data?.message?.extendedTextMessage?.text ||
+          body?.message?.conversation ||
+          body?.text || ''
+
+        if (phone && text) {
+          // Roda o agente em background — não bloqueia o webhook
+          runSdrAgent(phone, text).catch(e => console.error('[SDR] Agent error:', e.message))
+        }
+      }
     }
+
     return sendJson(res, 200, { ok: true })
   }
 

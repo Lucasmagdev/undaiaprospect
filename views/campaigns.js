@@ -414,12 +414,25 @@ function openSendDirectModal() {
             <button id="d-preset-save" type="button" style="padding:6px 14px;font-size:.78rem;background:var(--primary);color:#fff;border:none;border-radius:6px;cursor:pointer;font-weight:600;white-space:nowrap">💾 Salvar</button>
           </div>
 
-          <div class="tts-preview-panel">
-            <div>
-              <strong>Preview final</strong>
-              <span id="d-preview-meta">Ouça exatamente com o motor, voz, velocidade e ajustes acima.</span>
+          <!-- Preview panel -->
+          <div style="display:grid;gap:8px">
+            <div style="display:flex;gap:8px;align-items:center">
+              <span id="d-preview-meta" style="font-size:11px;color:var(--text-3);flex:1">Clique em Gerar para ouvir com as configurações atuais.</span>
+              <button id="d-preview" type="button" class="tts-preview-btn">🔊 Gerar preview</button>
             </div>
-            <button id="d-preview" type="button" class="tts-preview-btn">Ouvir preview</button>
+            <!-- Mini player (oculto até gerar áudio) -->
+            <div id="d-player" style="display:none;background:var(--surface-2);border:1px solid var(--border);border-radius:8px;padding:10px 12px">
+              <div style="display:flex;align-items:center;gap:10px">
+                <button id="d-play-pause" type="button" style="width:32px;height:32px;border-radius:50%;background:var(--primary);color:#fff;border:none;cursor:pointer;font-size:14px;display:flex;align-items:center;justify-content:center;flex-shrink:0">▶</button>
+                <div style="flex:1;display:grid;gap:4px">
+                  <input id="d-seek" type="range" min="0" max="100" value="0" step="0.1" style="width:100%;accent-color:var(--primary)" />
+                  <div style="display:flex;justify-content:space-between;font-size:10px;color:var(--text-3)">
+                    <span id="d-time-cur">0:00</span>
+                    <span id="d-time-dur">0:00</span>
+                  </div>
+                </div>
+              </div>
+            </div>
           </div>
 
         </div><!-- /d-audio-controls -->
@@ -541,34 +554,77 @@ function openSendDirectModal() {
       qa('input[name="d-char"]').forEach(r => r.addEventListener('change', () =>
         hlOpt('d-char', r.value, ['d-char-casual', 'd-char-enthusiastic', 'd-char-professional', 'd-char-custom'])))
 
-      // ── Preview ──────────────────────────────────────────────────────────
+      // ── Preview player ───────────────────────────────────────────────────
+      let currentAudio = null
+      let currentUrl   = null
+      let isSeeking    = false
+
+      const player      = q('d-player')
+      const playPauseBtn = q('d-play-pause')
+      const seekBar     = q('d-seek')
+      const timeCur     = q('d-time-cur')
+      const timeDur     = q('d-time-dur')
+
+      const fmtTime = s => isFinite(s) ? Math.floor(s / 60) + ':' + String(Math.floor(s % 60)).padStart(2, '0') : '0:00'
+
+      function attachPlayerListeners(audio) {
+        audio.addEventListener('timeupdate', () => {
+          if (!isSeeking && audio.duration) {
+            seekBar.value = (audio.currentTime / audio.duration) * 100
+            timeCur.textContent = fmtTime(audio.currentTime)
+          }
+        })
+        audio.addEventListener('loadedmetadata', () => { timeDur.textContent = fmtTime(audio.duration) })
+        audio.addEventListener('ended',  () => { playPauseBtn.textContent = '▶'; seekBar.value = 0; timeCur.textContent = '0:00' })
+        audio.addEventListener('play',   () => { playPauseBtn.textContent = '⏸' })
+        audio.addEventListener('pause',  () => { playPauseBtn.textContent = '▶' })
+      }
+
+      playPauseBtn.addEventListener('click', () => {
+        if (!currentAudio) return
+        currentAudio.paused ? currentAudio.play() : currentAudio.pause()
+      })
+
+      seekBar.addEventListener('mousedown',  () => { isSeeking = true })
+      seekBar.addEventListener('touchstart', () => { isSeeking = true })
+      seekBar.addEventListener('input', () => {
+        if (currentAudio && currentAudio.duration) {
+          currentAudio.currentTime = (seekBar.value / 100) * currentAudio.duration
+          timeCur.textContent = fmtTime(currentAudio.currentTime)
+        }
+      })
+      seekBar.addEventListener('mouseup',  () => { isSeeking = false })
+      seekBar.addEventListener('touchend', () => { isSeeking = false })
+
       q('d-preview').addEventListener('click', async () => {
         const btn  = q('d-preview')
         const meta = q('d-preview-meta')
         const payload = readDirectTtsPayload(bodyEl)
         if (!payload.text) { btn.style.borderColor = 'red'; setTimeout(() => btn.style.borderColor = '', 1500); return }
+
+        if (currentAudio) { currentAudio.pause(); currentAudio = null }
+        if (currentUrl)   { URL.revokeObjectURL(currentUrl); currentUrl = null }
+
         btn.textContent = 'Gerando...'; btn.disabled = true
-        if (meta) meta.textContent = 'Gerando audio com as configuracoes atuais...'
-        let url = ''
+        if (meta) meta.textContent = 'Gerando áudio...'
+
         try {
           const data = await WhatsAppInstanceService.previewTTS(payload)
           if (meta) meta.textContent = ttsPreviewMeta(data, payload.engine)
-          url = ttsPreviewUrl(data)
-          const audio = new Audio(url)
-          btn.textContent = 'Reproduzindo...'
-          audio.onended = () => { URL.revokeObjectURL(url); btn.textContent = 'Ouvir preview'; btn.disabled = false }
-          audio.onerror = () => {
-            if (url) URL.revokeObjectURL(url)
-            btn.textContent = 'Ouvir preview'
-            btn.disabled = false
-            alert('Erro: nao foi possivel tocar o preview.')
-          }
-          await audio.play()
+          currentUrl   = ttsPreviewUrl(data)
+          currentAudio = new Audio(currentUrl)
+          attachPlayerListeners(currentAudio)
+
+          player.style.display = 'block'
+          seekBar.value = 0; timeCur.textContent = '0:00'; timeDur.textContent = '0:00'
+
+          await currentAudio.play()
+          btn.textContent = '🔊 Gerar preview'; btn.disabled = false
         } catch (e) {
-          if (url) URL.revokeObjectURL(url)
-          btn.textContent = 'Ouvir preview'
-          btn.disabled = false
-          if (meta) meta.textContent = 'Nao foi possivel gerar o preview.'
+          if (currentUrl) { URL.revokeObjectURL(currentUrl); currentUrl = null }
+          currentAudio = null
+          btn.textContent = '🔊 Gerar preview'; btn.disabled = false
+          if (meta) meta.textContent = 'Não foi possível gerar o preview.'
           toast(e.message, 'error')
         }
       })
