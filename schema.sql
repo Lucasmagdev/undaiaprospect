@@ -58,10 +58,13 @@ create table if not exists public.leads (
   city text,
   address text,
   website text,
+  cnpj text,
+  email text,
   source text not null default 'manual'
-    check (source in ('manual', 'google_places', 'overpass', 'import', 'webhook', 'cnpj')),
+    check (source in ('manual', 'google_places', 'overpass', 'foursquare', 'guiamais', 'apontador', 'import', 'webhook', 'cnpj')),
   status text not null default 'new',
   last_interaction_at timestamptz,
+  raw_payload jsonb,
   created_at timestamptz not null default now()
 );
 

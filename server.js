@@ -166,6 +166,88 @@ function classifyBrazilianPhone(digits) {
   return 'unknown'
 }
 
+const SOURCE_PRIORITY = { cnpj: 6, guiamais: 5, apontador: 4, foursquare: 3, google_places: 3, overpass: 2, import: 1, manual: 1 }
+
+function uniq(values) {
+  return [...new Set(values.filter(Boolean))]
+}
+
+function normalizeLeadSourceList(lead = {}) {
+  return uniq([...(Array.isArray(lead.sources) ? lead.sources : []), lead.source])
+}
+
+function sourceRank(source) {
+  return SOURCE_PRIORITY[source] || 0
+}
+
+function sourceListRank(sources = []) {
+  return Math.max(0, ...sources.map(sourceRank))
+}
+
+function bestLeadSource(a, b) {
+  return sourceRank(b) > sourceRank(a) ? b : a
+}
+
+function discoveryQuality(lead = {}) {
+  const phoneType = classifyBrazilianPhone(lead.phone)
+  return [
+    phoneType === 'mobile' ? 50 : phoneType === 'landline' ? 20 : 0,
+    lead.phone ? 25 : 0,
+    lead.cnpj ? 20 : 0,
+    lead.website ? 8 : 0,
+    lead.email ? 5 : 0,
+    sourceListRank(normalizeLeadSourceList(lead)),
+  ].reduce((sum, n) => sum + n, 0)
+}
+
+function mergeLeadRecords(existing, incoming) {
+  if (!existing) {
+    const sources = normalizeLeadSourceList(incoming)
+    return {
+      ...incoming,
+      phone: normalizePhone(incoming.phone) || null,
+      cnpj: normalizePhone(incoming.cnpj) || incoming.cnpj || null,
+      sources,
+      source: incoming.source || sources[0] || 'import',
+    }
+  }
+
+  const currentSources = normalizeLeadSourceList(existing)
+  const incomingSources = normalizeLeadSourceList(incoming)
+  const sources = uniq([...currentSources, ...incomingSources])
+  const currentPhoneType = classifyBrazilianPhone(existing.phone)
+  const incomingPhoneType = classifyBrazilianPhone(incoming.phone)
+  const betterPhone =
+    (!existing.phone && incoming.phone) ||
+    (currentPhoneType !== 'mobile' && incomingPhoneType === 'mobile')
+
+  return {
+    ...existing,
+    name: existing.name || incoming.name,
+    phone: betterPhone ? normalizePhone(incoming.phone) : existing.phone,
+    address: existing.address || incoming.address,
+    website: existing.website || incoming.website,
+    cnpj: existing.cnpj || incoming.cnpj || null,
+    email: existing.email || incoming.email || null,
+    lat: existing.lat || incoming.lat || null,
+    lon: existing.lon || incoming.lon || null,
+    city: existing.city || incoming.city,
+    niche: existing.niche || incoming.niche,
+    source: bestLeadSource(existing.source, incoming.source),
+    sources,
+  }
+}
+
+function discoveryKey(lead = {}) {
+  const phone = normalizePhone(lead.phone)
+  if (phone) return `phone:${phone}`
+  const cnpj = normalizePhone(lead.cnpj)
+  if (cnpj) return `cnpj:${cnpj}`
+  const name = String(lead.name || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase().replace(/\W+/g, ' ').trim()
+  const address = String(lead.address || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase().replace(/\W+/g, ' ').trim()
+  return `name:${name}|${address}`
+}
+
 function sanitizeLike(value) {
   return String(value || '').replace(/[%*,]/g, '').trim()
 }
@@ -235,6 +317,7 @@ async function insertLeadRecord(record) {
   const clean = {
     ...record,
     normalized_phone: normalizePhone(record.normalized_phone || record.phone) || null,
+    cnpj: record.cnpj ? normalizePhone(record.cnpj) || String(record.cnpj) : null,
   }
 
   let result = await supabaseRequest('/leads', {
@@ -242,11 +325,39 @@ async function insertLeadRecord(record) {
     body: JSON.stringify(clean),
   })
 
-  if (!result.ok && isCheckViolation(result) && clean.source === 'overpass') {
+  if (!result.ok && isMissingColumn(result)) {
+    const compat = { ...clean }
+    delete compat.cnpj
+    delete compat.email
+    delete compat.raw_payload
     result = await supabaseRequest('/leads', {
       method: 'POST',
-      body: JSON.stringify({ ...clean, source: 'import' }),
+      body: JSON.stringify(compat),
     })
+  }
+
+  if (!result.ok && isCheckViolation(result)) {
+    const fallback = {
+      ...clean,
+      source: 'import',
+      raw_payload: {
+        ...(clean.raw_payload || {}),
+        original_source: clean.source,
+      },
+    }
+    result = await supabaseRequest('/leads', {
+      method: 'POST',
+      body: JSON.stringify(fallback),
+    })
+    if (!result.ok && isMissingColumn(result)) {
+      delete fallback.cnpj
+      delete fallback.email
+      delete fallback.raw_payload
+      result = await supabaseRequest('/leads', {
+        method: 'POST',
+        body: JSON.stringify(fallback),
+      })
+    }
   }
 
   return result
@@ -879,12 +990,14 @@ async function fetchCNPJLeads(niche, city, limit) {
     return {
       name: e.nome_fantasia || e.cnpj || '',
       phone,
+      cnpj: e.cnpj || null,
       address: e.uf ? `${e.municipio_nome}, ${e.uf}` : e.municipio_nome || null,
       website: null,
       email: e.email || null,
       niche,
       city: e.municipio_nome || city,
       source: 'cnpj',
+      raw_payload: { cnae_principal: e.cnae_principal, uf: e.uf },
     }
   })
 }
@@ -1076,13 +1189,16 @@ ${history}`
 // Motor principal do agente SDR
 // ─────────────────────────────────────────────────────────────────────────────
 
-const DEFAULT_RESPONSE = 'Oi! Obrigado por entrar em contato 😊 No momento não consigo te atender por aqui, mas em breve alguém do nosso time vai responder!'
-
 async function findOutboundMessage(phone) {
   const result = await supabaseRequest(
     `/messages?phone=eq.${encodeURIComponent(phone)}&direction=eq.outbound&order=created_at.desc&limit=1`
   )
   return result.ok && Array.isArray(result.data) && result.data.length ? result.data[0] : null
+}
+
+function isCampaignOutboundMessage(message = {}) {
+  const source = message.raw_payload?.source
+  return Boolean(message.campaign_id) || source === 'campaign' || source === 'campaign-test'
 }
 
 async function sendWhatsAppText(instanceName, phone, text) {
@@ -1098,11 +1214,11 @@ async function runSdrAgent(phone, incomingText) {
   const instance = await findDefaultOpenInstance()
   if (!instance?.evolution_instance_name) return
 
-  // Verifica se esse número recebeu alguma mensagem nossa antes
+  // So ativa o agente quando a ultima saida foi disparada por campanha.
   const outboundMsg = await findOutboundMessage(phone)
-  if (!outboundMsg) {
-    // Número desconhecido — resposta padrão e encerra
-    await sendWhatsAppText(instance.evolution_instance_name, phone, DEFAULT_RESPONSE)
+  if (!outboundMsg || !isCampaignOutboundMessage(outboundMsg)) {
+    // Nao envia fallback aqui: inbox/manual deve ficar silencioso.
+    console.log(`[SDR] Ignorado ${phone}: sem mensagem de campanha anterior.`)
     return
   }
 
@@ -1237,7 +1353,7 @@ async function handleApi(req, res, url) {
     const hasWebsite = url.searchParams.get('hasWebsite')
     const status = sanitizeLike(url.searchParams.get('status'))
     const params = [
-      'select=id,name,phone,normalized_phone,niche,city,address,website,source,status,last_interaction_at,created_at',
+      'select=id,name,phone,normalized_phone,niche,city,address,website,cnpj,email,source,status,raw_payload,last_interaction_at,created_at',
       'order=created_at.desc',
       'limit=200',
     ]
@@ -1245,7 +1361,11 @@ async function handleApi(req, res, url) {
     if (hasWebsite === 'true') params.push('website=not.is.null')
     if (hasWebsite === 'false') params.push('website=is.null')
     if (status) params.push(`status=eq.${encodeURIComponent(status)}`)
-    const result = await supabaseRequest(`/leads?${params.join('&')}`)
+    let result = await supabaseRequest(`/leads?${params.join('&')}`)
+    if (!result.ok && isMissingColumn(result)) {
+      params[0] = 'select=id,name,phone,normalized_phone,niche,city,address,website,source,status,last_interaction_at,created_at'
+      result = await supabaseRequest(`/leads?${params.join('&')}`)
+    }
     return sendJson(res, result.status, result.data)
   }
 
@@ -1261,8 +1381,11 @@ async function handleApi(req, res, url) {
       city: body.city || null,
       address: body.address || null,
       website: body.website || null,
+      cnpj: body.cnpj || null,
+      email: body.email || null,
       source: body.source || 'manual',
       status: body.status || 'new',
+      raw_payload: body.raw_payload || null,
     })
     return sendJson(res, result.status, result.data?.[0] || result.data)
   }
@@ -1810,24 +1933,26 @@ async function handleApi(req, res, url) {
       return sendJson(res, 502, { message: 'Nenhuma fonte retornou resultados. Tente novamente em instantes.' })
     }
 
-    // Merge: deduplica por telefone normalizado.
-    // Prioridade (quem sobrescreve): cnpj > guiamais > apontador > foursquare > overpass
-    const PRIORITY = { cnpj: 5, guiamais: 4, apontador: 3, foursquare: 2, overpass: 1 }
-    const phoneMap = new Map()
-    const noPhoneLeads = []
+    // Merge: deduplica por telefone, CNPJ ou nome/endereco e preserva todas as fontes.
+    const leadMap = new Map()
     for (const lead of all) {
-      if (!lead.phone) { noPhoneLeads.push(lead); continue }
-      const existing = phoneMap.get(lead.phone)
-      if (!existing || (PRIORITY[lead.source] || 0) > (PRIORITY[existing.source] || 0)) {
-        phoneMap.set(lead.phone, lead)
+      const normalized = {
+        ...lead,
+        phone: normalizePhone(lead.phone) || null,
+        cnpj: lead.cnpj ? normalizePhone(lead.cnpj) || String(lead.cnpj) : null,
       }
+      const key = discoveryKey(normalized)
+      leadMap.set(key, mergeLeadRecords(leadMap.get(key), normalized))
     }
 
-    const results = [...phoneMap.values(), ...noPhoneLeads]
+    const results = [...leadMap.values()]
       .map(lead => ({
         ...lead,
         phone_type: lead.phone ? classifyBrazilianPhone(lead.phone) : 'unknown',
+        quality_score: discoveryQuality(lead),
+        source_count: normalizeLeadSourceList(lead).length,
       }))
+      .sort((a, b) => b.quality_score - a.quality_score || sourceListRank(b.sources) - sourceListRank(a.sources))
       .slice(0, limit)
 
     return sendJson(res, 200, results)

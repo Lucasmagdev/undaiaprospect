@@ -80,6 +80,6 @@ end $$;
 
 alter table public.leads
   add constraint leads_source_check
-  check (source in ('manual', 'google_places', 'overpass', 'import', 'webhook', 'cnpj'));
+  check (source in ('manual', 'google_places', 'overpass', 'foursquare', 'guiamais', 'apontador', 'import', 'webhook', 'cnpj'));
 
 alter table if exists public.campaign_leads disable row level security;

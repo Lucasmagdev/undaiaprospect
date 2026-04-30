@@ -224,7 +224,10 @@ export const LeadService = {
       city: l.city || '—',
       niche: l.niche || '—',
       website: l.website || 'sem site',
+      cnpj: l.cnpj || '',
+      email: l.email || '',
       source: l.source || 'manual',
+      sources: l.raw_payload?.sources || [],
       status: l.status || 'new',
       last: compactDate(l.last_interaction_at || l.created_at),
     }))
@@ -251,8 +254,8 @@ export const LeadService = {
 
   async exportCSV() {
     const leads = await this.list({})
-    const headers = ['Empresa', 'Telefone', 'Cidade', 'Nicho', 'Website', 'Status', 'Ultima interacao']
-    const rows = leads.map(l => [l.name, l.phone, l.city, l.niche, l.website, l.status, l.last])
+    const headers = ['Empresa', 'Telefone', 'CNPJ', 'Email', 'Cidade', 'Nicho', 'Website', 'Fonte', 'Status', 'Ultima interacao']
+    const rows = leads.map(l => [l.name, l.phone, l.cnpj, l.email, l.city, l.niche, l.website, l.source, l.status, l.last])
     return [headers, ...rows].map(r => r.map(v => `"${v}"`).join(',')).join('\n')
   },
 }

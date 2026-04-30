@@ -38,7 +38,16 @@ function phoneTypeBadge(type) {
   return '<span class="badge-neutral" title="Tipo desconhecido">?</span>'
 }
 
+function formatCnpj(value) {
+  const d = String(value || '').replace(/\D/g, '')
+  if (d.length !== 14) return value || ''
+  return d.replace(/^(\d{2})(\d{3})(\d{3})(\d{4})(\d{2})$/, '$1.$2.$3/$4-$5')
+}
+
 function sourceBadge(source) {
+  if (Array.isArray(source)) {
+    return source.slice(0, 3).map(s => sourceBadge(s)).join('')
+  }
   const map = {
     overpass:      'OSM',
     foursquare:    '4sq',
@@ -67,11 +76,13 @@ function renderDiscoveryResults() {
             <div class="discovery-card-head">
               <strong>${lead.name}</strong>
               <div style="display:flex;gap:4px;align-items:center">
-                ${sourceBadge(lead.source)}
+                ${sourceBadge(lead.sources?.length ? lead.sources : lead.source)}
                 ${lead.phone ? phoneTypeBadge(lead.phone_type) : ''}
               </div>
             </div>
             ${lead.phone ? `<span class="discovery-phone">${lead.phone}</span>` : '<span class="muted">sem telefone</span>'}
+            ${lead.cnpj ? `<span class="muted" style="font-size:11px">CNPJ ${formatCnpj(lead.cnpj)}</span>` : ''}
+            ${lead.email ? `<span class="muted" style="font-size:11px">${lead.email}</span>` : ''}
             ${lead.address ? `<p class="discovery-addr">${lead.address}</p>` : ''}
             ${lead.website ? `<a href="${websiteHref(lead.website)}" target="_blank" rel="noopener" class="discovery-site">${lead.website}</a>` : ''}
             <button class="secondary import-one-btn" type="button" data-idx="${i}">Importar</button>
@@ -136,7 +147,7 @@ export function render() {
     </div>
 
     <section class="table-card" id="leads-table">
-      ${skeletonTable(4, 8)}
+      ${skeletonTable(4, 9)}
     </section>
   `
 }
@@ -148,9 +159,16 @@ async function importLead(lead, root) {
       phone: lead.phone || null,
       address: lead.address || null,
       website: lead.website || null,
+      cnpj: lead.cnpj || null,
+      email: lead.email || null,
       niche: lead.niche,
       city: lead.city,
       source: lead.source || 'overpass',
+      raw_payload: {
+        sources: lead.sources || [lead.source || 'overpass'],
+        quality_score: lead.quality_score || null,
+        source_count: lead.source_count || null,
+      },
       status: 'new',
     })
     toast(`${lead.name} importado para revisao.`, 'success')
@@ -171,9 +189,16 @@ async function importAll(root) {
         phone: lead.phone || null,
         address: lead.address || null,
         website: lead.website || null,
+        cnpj: lead.cnpj || null,
+        email: lead.email || null,
         niche: lead.niche,
         city: lead.city,
         source: lead.source || 'overpass',
+        raw_payload: {
+          sources: lead.sources || [lead.source || 'overpass'],
+          quality_score: lead.quality_score || null,
+          source_count: lead.source_count || null,
+        },
         status: 'new',
       })
       ok++
@@ -316,7 +341,7 @@ async function loadTable(root) {
       <table>
         <thead>
           <tr>
-            <th>Empresa</th><th>Telefone</th><th>Cidade</th>
+            <th>Empresa</th><th>Telefone</th><th>CNPJ</th><th>Cidade</th>
             <th>Nicho</th><th>Website</th><th>Fonte</th><th>Revisao</th><th>Acoes</th>
           </tr>
         </thead>
@@ -325,10 +350,11 @@ async function loadTable(root) {
             <tr data-lead-id="${l.id}">
               <td><strong>${l.name}</strong></td>
               <td>${l.phone}</td>
+              <td>${l.cnpj ? formatCnpj(l.cnpj) : '<span class="muted">sem CNPJ</span>'}</td>
               <td>${l.city}</td>
               <td>${l.niche}</td>
               <td>${l.website === 'sem site' ? `<span class="muted">sem site</span>` : `<a href="${websiteHref(l.website)}" target="_blank" rel="noopener" style="color:var(--green-600)">${l.website}</a>`}</td>
-              <td>${l.source}</td>
+              <td><div style="display:flex;gap:4px;flex-wrap:wrap">${sourceBadge(l.sources?.length ? l.sources : l.source)}</div></td>
               <td>${leadStatus(l.status)}<br><span class="muted" style="font-size:11px">${safetyStatus(l.status)}</span></td>
               <td>
                 <div style="display:flex;gap:6px;flex-wrap:wrap">
