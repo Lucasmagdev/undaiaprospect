@@ -1,6 +1,7 @@
 import http from 'node:http'
 import { existsSync, readFileSync } from 'node:fs'
 import { URL } from 'node:url'
+import { randomUUID } from 'node:crypto'
 
 function loadEnvFile(file) {
   if (!existsSync(file)) return
@@ -23,6 +24,10 @@ const EVOLUTION_API_KEY = process.env.EVOLUTION_API_KEY || ''
 const SUPABASE_URL = (process.env.SUPABASE_URL || '').replace(/\/$/, '')
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || ''
 const FOURSQUARE_API_KEY = process.env.FOURSQUARE_API_KEY || ''
+const YELP_API_KEY = process.env.YELP_API_KEY || ''
+const GOOGLE_PLACES_API_KEY = process.env.GOOGLE_PLACES_API_KEY || ''
+const GEOAPIFY_API_KEY = process.env.GEOAPIFY_API_KEY || ''
+const HERE_API_KEY = process.env.HERE_API_KEY || ''
 const ELEVENLABS_API_KEY = process.env.ELEVENLABS_API_KEY || ''
 const ELEVENLABS_VOICE_ID = process.env.ELEVENLABS_VOICE_ID || ''
 const TTS_SERVER_URL = (process.env.TTS_SERVER_URL || '').replace(/\/$/, '')
@@ -284,6 +289,8 @@ function campaignPatchPayload(payload = {}, compat = false) {
   if (compat) {
     if ('sent_count' in next) delete next.sent_count
     if ('failed_count' in next) delete next.failed_count
+    if ('neighborhood' in next) delete next.neighborhood
+    if ('use_audio' in next) delete next.use_audio
     if ('delay_min_s' in next) {
       next.delay_min_seconds = next.delay_min_s
       delete next.delay_min_s
@@ -778,13 +785,13 @@ function normalizeQrCode(data) {
 }
 
 const NICHE_TAGS = {
-  restaurante:   [['amenity', 'restaurant'], ['amenity', 'fast_food'], ['amenity', 'cafe'], ['shop', 'deli']],
-  odontologia:   [['amenity', 'dentist'], ['healthcare', 'dentist'], ['healthcare:speciality', 'dentistry']],
-  academia:      [['leisure', 'fitness_centre'], ['amenity', 'gym'], ['leisure', 'sports_centre']],
-  advocacia:     [['office', 'lawyer'], ['office', 'law_firm']],
-  contabilidade: [['office', 'accountant'], ['office', 'tax_advisor'], ['office', 'financial']],
-  estetica:      [['shop', 'beauty'], ['amenity', 'beauty_salon'], ['amenity', 'nail_salon'], ['shop', 'cosmetics']],
-  imobiliaria:   [['shop', 'estate_agent'], ['office', 'estate_agent']],
+  restaurante:   [['amenity', 'restaurant'], ['amenity', 'fast_food'], ['amenity', 'cafe'], ['shop', 'deli'], ['amenity', 'food_court'], ['amenity', 'snack_bar']],
+  odontologia:   [['amenity', 'dentist'], ['healthcare', 'dentist'], ['healthcare:speciality', 'dentistry'], ['amenity', 'clinic'], ['amenity', 'hospital']],
+  academia:      [['leisure', 'fitness_centre'], ['amenity', 'gym'], ['leisure', 'sports_centre'], ['leisure', 'dance'], ['leisure', 'yoga']],
+  advocacia:     [['office', 'lawyer'], ['office', 'law_firm'], ['office', 'yes']],
+  contabilidade: [['office', 'accountant'], ['office', 'tax_advisor'], ['office', 'financial'], ['office', 'consulting']],
+  estetica:      [['shop', 'beauty'], ['amenity', 'beauty_salon'], ['amenity', 'nail_salon'], ['shop', 'cosmetics'], ['shop', 'hairdresser'], ['amenity', 'hairdresser']],
+  imobiliaria:   [['shop', 'estate_agent'], ['office', 'estate_agent'], ['office', 'real_estate']],
 }
 
 // CNAEs por nicho — mesmos códigos do scripts/import-cnpj.mjs
@@ -816,20 +823,66 @@ const NICHE_TERMS = {
   imobiliaria:   'imobiliaria corretor imoveis',
 }
 
+const GOOGLE_QUERY_TERMS = {
+  restaurante:   ['restaurante', 'restaurante delivery', 'lanchonete', 'pizzaria', 'bar restaurante'],
+  odontologia:   ['dentista', 'clinica odontologica', 'odontologia', 'implante dentario', 'ortodontista'],
+  academia:      ['academia', 'studio fitness', 'crossfit', 'pilates', 'personal trainer'],
+  advocacia:     ['advogado', 'escritorio de advocacia', 'advocacia empresarial', 'advogado trabalhista'],
+  contabilidade: ['contador', 'escritorio de contabilidade', 'contabilidade empresarial', 'consultoria contabil'],
+  estetica:      ['clinica de estetica', 'salao de beleza', 'estetica facial', 'manicure', 'depilacao'],
+  imobiliaria:   ['imobiliaria', 'corretor de imoveis', 'administradora de imoveis', 'imoveis'],
+}
+
+// Cache Nominatim → { areaId, lat, lon } (evita bater na API várias vezes para mesma cidade)
+const nominatimCache = new Map()
+
+async function resolveCity(city) {
+  const key = city.toLowerCase().trim()
+  if (nominatimCache.has(key)) return nominatimCache.get(key)
+
+  try {
+    const r = await fetch(
+      `https://nominatim.openstreetmap.org/search?q=${encodeURIComponent(city + ' Brasil')}&format=json&limit=5&featuretype=city`,
+      { headers: { 'User-Agent': 'undaia-prospect/1.0' }, signal: AbortSignal.timeout(10_000) },
+    )
+    if (!r.ok) return null
+    const places = await r.json()
+    const place = places.find(p => p.osm_type === 'relation') || places[0]
+    if (!place) return null
+    const areaId = place.osm_type === 'relation'
+      ? 3600000000 + parseInt(place.osm_id)
+      : parseInt(place.osm_id)
+    const result = { areaId, lat: parseFloat(place.lat), lon: parseFloat(place.lon) }
+    nominatimCache.set(key, result)
+    return result
+  } catch {
+    return null
+  }
+}
+
 async function fetchOverpassLeads(niche, city, limit) {
   const tags = NICHE_TAGS[niche] || [['name', niche]]
   const unionParts = tags.flatMap(([k, v]) => [
     `node["${k}"="${v}"](area.a);`,
     `way["${k}"="${v}"](area.a);`,
   ]).join('')
-  // Removido ["boundary"="administrative"] — era muito restritivo para cidades BR no OSM.
-  // admin_level 8 cobre municípios brasileiros; fallback para 7 cobre alguns casos especiais.
-  const query = `[out:json][timeout:30];(area["name"="${city}"]["admin_level"="8"];area["name"="${city}"]["admin_level"="7"];)->.a;(${unionParts});out center tags ${limit};`
+
+  // Capa o limit no Overpass (cidades grandes como SP travam sem isso)
+  const overpassLimit = Math.min(limit, 50)
+  let query
+  const cityData = await resolveCity(city)
+  if (cityData?.areaId) {
+    // Resolve via Nominatim → garante nome com acento correto no OSM
+    query = `[out:json][timeout:25][maxsize:64000000];area(${cityData.areaId})->.a;(${unionParts});out center tags ${overpassLimit};`
+  } else {
+    // Fallback: busca por nome direto com admin_level BR
+    query = `[out:json][timeout:25][maxsize:64000000];(area["name"="${city}"]["admin_level"="8"];area["name"="${city}"]["admin_level"="7"];)->.a;(${unionParts});out center tags ${overpassLimit};`
+  }
 
   const r = await fetch('https://overpass-api.de/api/interpreter', {
     method: 'POST',
     headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'Accept': '*/*', 'User-Agent': 'undaia-prospect/1.0' },
-    body: new URLSearchParams({ data: query }),
+    body: 'data=' + encodeURIComponent(query),
     signal: AbortSignal.timeout(35_000),
   })
   if (!r.ok) return []
@@ -893,44 +946,146 @@ const SCRAPER_HEADERS = {
   'Accept-Language': 'pt-BR,pt;q=0.9',
 }
 
-async function fetchGuiaMaisLeads(niche, city, limit) {
+// GuiaMais era JS-rendered (SPA) — substituído por Yelp Fusion que tem cobertura BR + telefones
+async function fetchYelpLeads(niche, city, limit) {
+  if (!YELP_API_KEY) return []
   const term = encodeURIComponent(NICHE_TERMS[niche] || niche)
-  const where = encodeURIComponent(city)
-  let html
+  const location = encodeURIComponent(`${city}, Brasil`)
   try {
     const r = await fetch(
-      `https://www.guiamais.com.br/busca?searchedTerm=${term}&where=${where}`,
-      { headers: SCRAPER_HEADERS, signal: AbortSignal.timeout(15_000) },
+      `https://api.yelp.com/v3/businesses/search?term=${term}&location=${location}&limit=${Math.min(limit, 50)}&locale=pt_BR`,
+      {
+        headers: { 'Authorization': `Bearer ${YELP_API_KEY}`, 'Accept': 'application/json' },
+        signal: AbortSignal.timeout(15_000),
+      },
     )
     if (!r.ok) return []
-    html = await r.text()
+    const data = await r.json()
+    if (!Array.isArray(data.businesses)) return []
+    return data.businesses.map(b => ({
+      name: b.name || '',
+      phone: b.phone ? normalizePhone(b.phone) : null,
+      address: [b.location?.address1, b.location?.city].filter(Boolean).join(', ') || null,
+      website: b.url || null,
+      niche,
+      city,
+      lat: b.coordinates?.latitude || null,
+      lon: b.coordinates?.longitude || null,
+      source: 'yelp',
+    }))
   } catch {
     return []
   }
-  return extractJsonLd(html)
-    .map(item => jsonLdToLead(item, niche, city, 'guiamais'))
-    .filter(Boolean)
-    .slice(0, limit)
 }
 
-async function fetchApontadorLeads(niche, city, limit) {
-  const what = encodeURIComponent(NICHE_TERMS[niche] || niche)
-  const where = encodeURIComponent(city)
-  let html
+async function fetchGooglePlacesLeads(niche, city, limit) {
+  if (!GOOGLE_PLACES_API_KEY) return []
+
+  const terms = uniq([
+    ...(GOOGLE_QUERY_TERMS[niche] || []),
+    NICHE_TERMS[niche] || niche,
+    niche,
+  ]).slice(0, 5)
+
+  const placeMap = new Map()
   try {
-    const r = await fetch(
-      `https://www.apontador.com.br/local/search/result/page/1?what=${what}&where=${where}`,
-      { headers: SCRAPER_HEADERS, signal: AbortSignal.timeout(15_000) },
+    for (const term of terms) {
+      if (placeMap.size >= Math.min(limit * 2, 60)) break
+      let pageToken = ''
+
+      for (let page = 0; page < 2; page++) {
+        if (pageToken) await new Promise(resolve => setTimeout(resolve, 1800))
+        const params = new URLSearchParams({
+          query: `${term} em ${city}`,
+          language: 'pt-BR',
+          region: 'br',
+          key: GOOGLE_PLACES_API_KEY,
+        })
+        if (pageToken) params.set('pagetoken', pageToken)
+
+        const r = await fetch(
+          `https://maps.googleapis.com/maps/api/place/textsearch/json?${params}`,
+          { signal: AbortSignal.timeout(15_000) },
+        )
+        if (!r.ok) break
+        const data = await r.json()
+        if (!Array.isArray(data.results)) break
+
+        for (const place of data.results) {
+          if (place.place_id && !placeMap.has(place.place_id)) {
+            placeMap.set(place.place_id, { ...place, search_term: term })
+          }
+        }
+
+        pageToken = data.next_page_token || ''
+        if (!pageToken || placeMap.size >= Math.min(limit * 2, 60)) break
+      }
+    }
+
+    const tops = [...placeMap.values()]
+      .sort((a, b) => Number(b.user_ratings_total || 0) - Number(a.user_ratings_total || 0))
+      .slice(0, Math.min(limit * 2, 35))
+
+    const detailed = await Promise.allSettled(
+      tops.map(async p => {
+        try {
+          const dr = await fetch(
+            `https://maps.googleapis.com/maps/api/place/details/json?place_id=${p.place_id}&fields=place_id,name,formatted_phone_number,international_phone_number,formatted_address,website,geometry,rating,user_ratings_total,business_status,types,url&language=pt-BR&key=${GOOGLE_PLACES_API_KEY}`,
+            { signal: AbortSignal.timeout(8_000) },
+          )
+          const dd = await dr.json()
+          const d = dd.result || {}
+          return {
+            name: d.name || p.name || '',
+            phone: normalizePhone(d.formatted_phone_number || d.international_phone_number) || null,
+            address: d.formatted_address || p.formatted_address || null,
+            website: d.website || null,
+            niche,
+            city,
+            lat: d.geometry?.location?.lat || p.geometry?.location?.lat || null,
+            lon: d.geometry?.location?.lng || p.geometry?.location?.lng || null,
+            source: 'google_places',
+            raw_payload: {
+              place_id: d.place_id || p.place_id,
+              rating: d.rating || p.rating || null,
+              user_ratings_total: d.user_ratings_total || p.user_ratings_total || null,
+              business_status: d.business_status || p.business_status || null,
+              maps_url: d.url || null,
+              types: d.types || p.types || [],
+              search_term: p.search_term || null,
+            },
+          }
+        } catch {
+          return {
+            name: p.name || '',
+            phone: null,
+            address: p.formatted_address || null,
+            website: null,
+            niche,
+            city,
+            lat: p.geometry?.location?.lat || null,
+            lon: p.geometry?.location?.lng || null,
+            source: 'google_places',
+            raw_payload: {
+              place_id: p.place_id || null,
+              rating: p.rating || null,
+              user_ratings_total: p.user_ratings_total || null,
+              business_status: p.business_status || null,
+              types: p.types || [],
+              search_term: p.search_term || null,
+            },
+          }
+        }
+      }),
     )
-    if (!r.ok) return []
-    html = await r.text()
+    return detailed
+      .filter(r => r.status === 'fulfilled')
+      .map(r => r.value)
+      .filter(lead => lead.name)
+      .slice(0, limit)
   } catch {
     return []
   }
-  return extractJsonLd(html)
-    .map(item => jsonLdToLead(item, niche, city, 'apontador'))
-    .filter(Boolean)
-    .slice(0, limit)
 }
 
 async function fetchFoursquareLeads(niche, city, limit) {
@@ -964,6 +1119,91 @@ async function fetchFoursquareLeads(niche, city, limit) {
   }))
 }
 
+// Geoapify Places — 3.000 req/dia grátis (geoapify.com)
+// Categorias OSM compatíveis com os nichos
+const GEOAPIFY_CATEGORIES = {
+  restaurante:   'catering.restaurant,catering.fast_food,catering.cafe',
+  odontologia:   'healthcare.dentist',
+  academia:      'sport.fitness,sport.gym',
+  advocacia:     'office.lawyer',
+  contabilidade: 'office.accountant',
+  estetica:      'commercial.beauty',
+  imobiliaria:   'commercial.real_estate',
+}
+
+async function fetchGeoapifyLeads(niche, city, limit) {
+  if (!GEOAPIFY_API_KEY) return []
+  const cityData = await resolveCity(city)
+  if (!cityData?.lat) return []
+  const cats = GEOAPIFY_CATEGORIES[niche]
+  if (!cats) return []
+  try {
+    const r = await fetch(
+      `https://api.geoapify.com/v2/places?categories=${encodeURIComponent(cats)}&filter=circle:${cityData.lon},${cityData.lat},15000&limit=${Math.min(limit, 100)}&apiKey=${GEOAPIFY_API_KEY}`,
+      { signal: AbortSignal.timeout(15_000) },
+    )
+    if (!r.ok) return []
+    const data = await r.json()
+    if (!Array.isArray(data.features)) return []
+    return data.features.map(f => {
+      const p = f.properties || {}
+      return {
+        name: p.name || '',
+        phone: p.contact?.phone ? normalizePhone(p.contact.phone) : null,
+        address: [p.address_line1, p.city].filter(Boolean).join(', ') || p.formatted || null,
+        website: p.website || null,
+        niche,
+        city,
+        lat: f.geometry?.coordinates?.[1] || null,
+        lon: f.geometry?.coordinates?.[0] || null,
+        source: 'geoapify',
+      }
+    }).filter(l => l.name)
+  } catch {
+    return []
+  }
+}
+
+// HERE Discover — 250.000 req/mês grátis (developer.here.com)
+const HERE_CATEGORIES = {
+  restaurante:   '100-1000-0000',
+  odontologia:   '800-8200-0163',
+  academia:      '400-4100-0046',
+  advocacia:     '700-7000-0298',
+  contabilidade: '700-7000-0107',
+  estetica:      '600-6950-0000',
+  imobiliaria:   '700-7000-0110',
+}
+
+async function fetchHERELeads(niche, city, limit) {
+  if (!HERE_API_KEY) return []
+  const cityData = await resolveCity(city)
+  if (!cityData?.lat) return []
+  const term = encodeURIComponent(NICHE_TERMS[niche] || niche)
+  try {
+    const r = await fetch(
+      `https://discover.search.hereapi.com/v1/discover?at=${cityData.lat},${cityData.lon}&q=${term}&limit=${Math.min(limit, 100)}&lang=pt-BR&apiKey=${HERE_API_KEY}`,
+      { signal: AbortSignal.timeout(15_000) },
+    )
+    if (!r.ok) return []
+    const data = await r.json()
+    if (!Array.isArray(data.items)) return []
+    return data.items.map(item => ({
+      name: item.title || '',
+      phone: item.contacts?.[0]?.phone?.[0]?.value ? normalizePhone(item.contacts[0].phone[0].value) : null,
+      address: item.address?.label || null,
+      website: item.contacts?.[0]?.www?.[0]?.value || null,
+      niche,
+      city,
+      lat: item.position?.lat || null,
+      lon: item.position?.lng || null,
+      source: 'here',
+    })).filter(l => l.name)
+  } catch {
+    return []
+  }
+}
+
 async function fetchCNPJLeads(niche, city, limit) {
   const cnaes = CNAE_MAP[niche]
   if (!cnaes?.length) return []
@@ -981,7 +1221,15 @@ async function fetchCNPJLeads(niche, city, limit) {
   ]
 
   const result = await supabaseRequest(`/cnpj_empresas?${params.join('&')}`)
-  if (!result.ok || !Array.isArray(result.data)) return []
+  if (!result.ok) {
+    // Tabela não existe → loga instrução clara e retorna []
+    const errCode = result.data?.code || ''
+    if (errCode === 'PGRST205' || errCode === '42P01') {
+      console.warn('[CNPJ] Tabela cnpj_empresas não existe. Execute o SQL em scripts/cnpj-schema.sql no Supabase e depois: node scripts/import-cnpj.mjs --file 0')
+    }
+    return []
+  }
+  if (!Array.isArray(result.data)) return []
 
   return result.data.map(e => {
     const rawPhone = (e.ddd1 || '') + (e.telefone1 || '')
@@ -1002,6 +1250,95 @@ async function fetchCNPJLeads(niche, city, limit) {
   })
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// PILOTO AUTOMÁTICO — análise de site + personalização com IA
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Estado em memória dos jobs (perdido ao reiniciar — proposital, é ephemeral)
+const autopilotJobs = new Map()
+
+function extractTextFromHTML(html) {
+  return html
+    .replace(/<script[\s\S]*?<\/script>/gi, '')
+    .replace(/<style[\s\S]*?<\/style>/gi, '')
+    .replace(/<nav[\s\S]*?<\/nav>/gi, '')
+    .replace(/<footer[\s\S]*?<\/footer>/gi, '')
+    .replace(/<header[\s\S]*?<\/header>/gi, '')
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/&[a-z]+;/gi, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .substring(0, 700)
+}
+
+async function analyzeWebsite(url) {
+  if (!url) return null
+  try {
+    const cleanUrl = url.startsWith('http') ? url : `https://${url}`
+    const r = await fetch(cleanUrl, {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+        'Accept': 'text/html',
+        'Accept-Language': 'pt-BR,pt;q=0.9',
+      },
+      signal: AbortSignal.timeout(10_000),
+      redirect: 'follow',
+    })
+    if (!r.ok) return null
+    return extractTextFromHTML(await r.text()) || null
+  } catch {
+    return null
+  }
+}
+
+async function generatePersonalizedMessage(lead, siteContent, baseTemplate) {
+  if (!GROQ_API_KEY) return null
+  const siteInfo = siteContent ? `\nInformações do site deles: ${siteContent.substring(0, 350)}` : ''
+  const prompt = `Você é um especialista em prospecção B2B via WhatsApp no Brasil.
+Gere uma mensagem personalizada e direta para prospectar a empresa abaixo.
+
+Empresa: ${lead.name || 'empresa'}
+Segmento: ${lead.niche || ''}
+Cidade: ${lead.city || ''}${siteInfo}
+
+Mensagem base do vendedor (adapte e personalize):
+"${baseTemplate}"
+
+REGRAS OBRIGATÓRIAS:
+- Máximo 4 linhas curtas
+- Mencione algo específico do negócio SE tiver info do site
+- Tom profissional e próximo, como uma pessoa real
+- Termine com uma pergunta simples de qualificação
+- NÃO invente informações
+- Responda SOMENTE com o texto da mensagem`
+
+  try {
+    const r = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${GROQ_API_KEY}` },
+      body: JSON.stringify({
+        model: GROQ_MODEL,
+        messages: [{ role: 'user', content: prompt }],
+        temperature: 0.75,
+        max_tokens: 200,
+      }),
+      signal: AbortSignal.timeout(20_000),
+    })
+    const data = await r.json()
+    return data.choices?.[0]?.message?.content?.trim() || null
+  } catch {
+    return null
+  }
+}
+
+function interpolateTemplate(template, lead, niche, city) {
+  return (template || '')
+    .replace(/{nome_empresa}/g, lead.name || '')
+    .replace(/{cidade}/g, lead.city || city || '')
+    .replace(/{nicho}/g, lead.niche || niche || '')
+    .replace(/{servico}/g, lead.niche || niche || '')
+}
+
 async function checkWhatsAppNumbers(instanceName, phones) {
   try {
     const result = await evolutionRequest(
@@ -1018,6 +1355,194 @@ async function checkWhatsAppNumbers(instanceName, phones) {
 // ─────────────────────────────────────────────────────────────────────────────
 // GROQ — LLM para agente SDR
 // ─────────────────────────────────────────────────────────────────────────────
+
+function parseJsonLoose(text) {
+  if (!text) return null
+  try {
+    return JSON.parse(text)
+  } catch {
+    const match = String(text).match(/\{[\s\S]*\}/)
+    if (!match) return null
+    try {
+      return JSON.parse(match[0])
+    } catch {
+      return null
+    }
+  }
+}
+
+function baseAutopilotMessage(lead, niche, city) {
+  return `Oi, tudo bem? Vi a ${lead.name || 'empresa'} em ${lead.city || city} e queria entender se hoje voces ja usam algum sistema para organizar a rotina de ${lead.niche || niche}. Faz sentido eu te fazer uma pergunta rapida? Se nao quiser receber contato, e so me avisar.`
+}
+
+function localLeadScore(lead = {}, alreadyContacted = false, whatsappStatus = 'unknown') {
+  let score = 0
+  const reasons = []
+  const phoneType = classifyBrazilianPhone(lead.phone)
+
+  if (phoneType === 'mobile') { score += 30; reasons.push('telefone movel') }
+  else if (phoneType === 'landline') { score += 8; reasons.push('telefone fixo') }
+  if (whatsappStatus === 'valid') { score += 25; reasons.push('WhatsApp confirmado') }
+  if (lead.website) { score += 14; reasons.push('site encontrado') }
+  if (lead.cnpj) { score += 10; reasons.push('CNPJ encontrado') }
+  if (lead.email) { score += 4; reasons.push('email encontrado') }
+  const sourceCount = normalizeLeadSourceList(lead).length
+  if (sourceCount > 1) { score += Math.min(12, sourceCount * 4); reasons.push(`${sourceCount} fontes`) }
+  score += Math.min(10, sourceListRank(normalizeLeadSourceList(lead)))
+  if (alreadyContacted) { score -= 50; reasons.push('ja contatado') }
+  if (whatsappStatus === 'invalid') { score -= 60; reasons.push('sem WhatsApp confirmado') }
+
+  return { score: Math.max(0, Math.min(100, score)), reasons }
+}
+
+async function enrichLeadWithAi(lead, siteContent, niche, city) {
+  const fallback = {
+    score_delta: 0,
+    intent: 'medio',
+    reason: siteContent ? 'Site analisado, mas IA indisponivel.' : 'Sem site para analise profunda.',
+    message: baseAutopilotMessage(lead, niche, city),
+  }
+  if (!GROQ_API_KEY) return fallback
+
+  const prompt = `Voce prepara prospeccao B2B responsavel por WhatsApp para negocios locais no Brasil.
+Analise o lead e retorne SOMENTE JSON valido.
+
+Lead:
+- Empresa: ${lead.name || ''}
+- Nicho: ${lead.niche || niche}
+- Cidade: ${lead.city || city}
+- Fontes: ${normalizeLeadSourceList(lead).join(', ') || 'nao informado'}
+- Site/texto: ${(siteContent || 'sem site analisavel').slice(0, 1200)}
+
+JSON obrigatorio:
+{
+  "score_delta": numero inteiro de -15 a 20,
+  "intent": "alto" | "medio" | "baixo",
+  "reason": "motivo curto do score, sem inventar fatos",
+  "message": "mensagem curta, educada, maximo 4 linhas, sem prometer resultado, com uma pergunta simples e opcao de parar contato"
+}
+
+Regras:
+- Nao invente informacoes.
+- Nao use tom agressivo.
+- Identifique claramente que e uma abordagem comercial leve.
+- Nao mencione automacao de envio.`
+
+  try {
+    const content = await groqChat([{ role: 'user', content: prompt }], { temperature: 0.45, maxTokens: 320 })
+    const parsed = parseJsonLoose(content)
+    if (!parsed || !parsed.message) return fallback
+    return {
+      score_delta: Math.max(-15, Math.min(20, Number(parsed.score_delta || 0))),
+      intent: ['alto', 'medio', 'baixo'].includes(parsed.intent) ? parsed.intent : 'medio',
+      reason: String(parsed.reason || fallback.reason).slice(0, 180),
+      message: String(parsed.message || fallback.message).trim().slice(0, 700),
+    }
+  } catch {
+    return fallback
+  }
+}
+
+async function discoverAutopilotLeads(niche, city, limit) {
+  const sources = await Promise.allSettled([
+    fetchOverpassLeads(niche, city, limit),
+    fetchFoursquareLeads(niche, city, limit),
+    fetchYelpLeads(niche, city, limit),
+    fetchGooglePlacesLeads(niche, city, limit),
+    fetchGeoapifyLeads(niche, city, limit),
+    fetchHERELeads(niche, city, limit),
+    fetchCNPJLeads(niche, city, limit),
+  ])
+
+  const raw = sources.flatMap(source => source.status === 'fulfilled' ? source.value : [])
+  const leadMap = new Map()
+  for (const lead of raw) {
+    const normalized = {
+      ...lead,
+      phone: normalizePhone(lead.phone) || null,
+      cnpj: lead.cnpj ? normalizePhone(lead.cnpj) || String(lead.cnpj) : null,
+      niche: lead.niche || niche,
+      city: lead.city || city,
+    }
+    const key = discoveryKey(normalized)
+    leadMap.set(key, mergeLeadRecords(leadMap.get(key), normalized))
+  }
+
+  return [...leadMap.values()]
+    .map(lead => ({
+      ...lead,
+      phone: normalizePhone(lead.phone) || null,
+      phone_type: lead.phone ? classifyBrazilianPhone(lead.phone) : 'unknown',
+      quality_score: discoveryQuality(lead),
+      source_count: normalizeLeadSourceList(lead).length,
+    }))
+    .filter(lead => lead.phone)
+    .sort((a, b) => b.quality_score - a.quality_score || sourceListRank(b.sources) - sourceListRank(a.sources))
+    .slice(0, limit)
+}
+
+async function getLeadContactFlags(phones) {
+  const flags = new Map()
+  for (const phone of phones) {
+    const normalized = normalizePhone(phone)
+    if (!normalized) continue
+    const leadRes = await supabaseRequest(`/leads?normalized_phone=eq.${encodeURIComponent(normalized)}&select=id,status,last_interaction_at&limit=1`)
+    const lead = leadRes.ok && Array.isArray(leadRes.data) ? leadRes.data[0] : null
+    const msgRes = await supabaseRequest(`/messages?phone=eq.${encodeURIComponent(normalized)}&direction=eq.outbound&select=id,status,sent_at,created_at&limit=1`)
+    const message = msgRes.ok && Array.isArray(msgRes.data) ? msgRes.data[0] : null
+    flags.set(normalized, {
+      lead_id: lead?.id || null,
+      lead_status: lead?.status || null,
+      already_contacted: Boolean(message || ['sent', 'responded', 'opt_out', 'invalid'].includes(lead?.status)),
+      blocked: ['opt_out', 'invalid'].includes(lead?.status),
+    })
+  }
+  return flags
+}
+
+async function findWhatsappInstanceById(instanceId) {
+  if (!instanceId) return null
+  let result = await supabaseRequest(`/whatsapp_instances?id=eq.${encodeURIComponent(instanceId)}&select=*&limit=1`)
+  if (result.ok && Array.isArray(result.data) && result.data[0]) return result.data[0]
+
+  result = await supabaseRequest(`/whatsapp_instances?evolution_instance_name=eq.${encodeURIComponent(instanceId)}&select=*&limit=1`)
+  if (result.ok && Array.isArray(result.data) && result.data[0]) return result.data[0]
+
+  result = await supabaseRequest(`/whatsapp_instances?evolution_instance_id=eq.${encodeURIComponent(instanceId)}&select=*&limit=1`)
+  if (result.ok && Array.isArray(result.data) && result.data[0]) return result.data[0]
+
+  return null
+}
+
+async function ensureLeadRecordFromPreview(item, niche, city) {
+  const phone = normalizePhone(item.phone)
+  if (!phone) return null
+  const existing = await supabaseRequest(`/leads?normalized_phone=eq.${encodeURIComponent(phone)}&select=*&limit=1`)
+  if (existing.ok && Array.isArray(existing.data) && existing.data[0]) return existing.data[0]
+
+  const insert = await insertLeadRecord({
+    id: randomUUID(),
+    name: item.name || 'Lead sem nome',
+    phone,
+    normalized_phone: phone,
+    niche: item.niche || niche,
+    city: item.city || city,
+    address: item.address || null,
+    website: item.website || null,
+    cnpj: item.cnpj || null,
+    email: item.email || null,
+    source: item.source || 'import',
+    status: 'new',
+    raw_payload: {
+      ...(item.raw_payload || {}),
+      autopilot_preview_id: item.preview_id || null,
+      autopilot_score: item.score || null,
+      autopilot_reasons: item.score_reasons || [],
+      autopilot_message: item.message || null,
+    },
+  })
+  return insert.ok ? insert.data?.[0] || null : null
+}
 
 async function groqChat(messages, { temperature = 0.7, maxTokens = 300 } = {}) {
   if (!GROQ_API_KEY) throw new Error('GROQ_API_KEY não configurada.')
@@ -1907,6 +2432,23 @@ async function handleApi(req, res, url) {
     })
   }
 
+  if (url.pathname === '/api/search/sources' && req.method === 'GET') {
+    // Verifica se a tabela CNPJ existe no Supabase
+    const cnpjCheck = await supabaseRequest('/cnpj_empresas?select=cnpj&limit=1')
+    const cnpjReady = cnpjCheck.ok && !cnpjCheck.data?.code
+    const cnpjCount = cnpjReady ? 'OK' : 0
+
+    return sendJson(res, 200, {
+      overpass:      { active: true,                      description: 'OpenStreetMap — gratuito, sem chave. Funciona mas tem poucos telefones BR.' },
+      cnpj:          { active: cnpjReady,                 description: cnpjReady ? `Receita Federal BR — dados importados.` : 'Receita Federal BR — tabela não criada. Rode: scripts/cnpj-schema.sql no Supabase + node scripts/import-cnpj.mjs --file 0', setup_required: !cnpjReady },
+      yelp:          { active: !!YELP_API_KEY,            description: 'Yelp Fusion — 500 req/dia grátis • yelp.com/developers (var: YELP_API_KEY)' },
+      geoapify:      { active: !!GEOAPIFY_API_KEY,        description: 'Geoapify Places — 3.000 req/dia grátis • geoapify.com (var: GEOAPIFY_API_KEY)' },
+      here:          { active: !!HERE_API_KEY,            description: 'HERE Discover — 250k req/mês grátis • developer.here.com (var: HERE_API_KEY)' },
+      foursquare:    { active: !!FOURSQUARE_API_KEY,      description: 'Foursquare Places — chave gratuita • developer.foursquare.com (var: FOURSQUARE_API_KEY)' },
+      google_places: { active: !!GOOGLE_PLACES_API_KEY,   description: 'Google Places — melhor cobertura + telefones • console.cloud.google.com (var: GOOGLE_PLACES_API_KEY)' },
+    })
+  }
+
   if (url.pathname === '/api/search/leads' && req.method === 'GET') {
     const niche = (url.searchParams.get('niche') || '').toLowerCase().trim()
     const city = (url.searchParams.get('city') || '').trim()
@@ -1914,23 +2456,41 @@ async function handleApi(req, res, url) {
 
     if (!niche || !city) return sendJson(res, 400, { message: 'niche e city sao obrigatorios.' })
 
-    const [overpassSettled, fsqSettled, guiamaisSettled, apontadorSettled, cnpjSettled] = await Promise.allSettled([
+    const [overpassSettled, fsqSettled, yelpSettled, googleSettled, geoapifySettled, hereSettled, cnpjSettled] = await Promise.allSettled([
       fetchOverpassLeads(niche, city, limit),
       fetchFoursquareLeads(niche, city, limit),
-      fetchGuiaMaisLeads(niche, city, limit),
-      fetchApontadorLeads(niche, city, limit),
+      fetchYelpLeads(niche, city, limit),
+      fetchGooglePlacesLeads(niche, city, limit),
+      fetchGeoapifyLeads(niche, city, limit),
+      fetchHERELeads(niche, city, limit),
       fetchCNPJLeads(niche, city, limit),
     ])
 
     const overpassLeads  = overpassSettled.status  === 'fulfilled' ? overpassSettled.value  : []
     const fsqLeads       = fsqSettled.status       === 'fulfilled' ? fsqSettled.value       : []
-    const guiamaisLeads  = guiamaisSettled.status  === 'fulfilled' ? guiamaisSettled.value  : []
-    const apontadorLeads = apontadorSettled.status === 'fulfilled' ? apontadorSettled.value : []
+    const yelpLeads      = yelpSettled.status      === 'fulfilled' ? yelpSettled.value      : []
+    const googleLeads    = googleSettled.status    === 'fulfilled' ? googleSettled.value    : []
+    const geoapifyLeads  = geoapifySettled.status  === 'fulfilled' ? geoapifySettled.value  : []
+    const hereLeads      = hereSettled.status      === 'fulfilled' ? hereSettled.value      : []
     const cnpjLeads      = cnpjSettled.status      === 'fulfilled' ? cnpjSettled.value      : []
 
-    const all = [...overpassLeads, ...fsqLeads, ...guiamaisLeads, ...apontadorLeads, ...cnpjLeads]
+    const sourceStats = {
+      overpass:      { count: overpassLeads.length,  active: true },
+      foursquare:    { count: fsqLeads.length,       active: !!FOURSQUARE_API_KEY },
+      yelp:          { count: yelpLeads.length,      active: !!YELP_API_KEY },
+      google_places: { count: googleLeads.length,    active: !!GOOGLE_PLACES_API_KEY },
+      geoapify:      { count: geoapifyLeads.length,  active: !!GEOAPIFY_API_KEY },
+      here:          { count: hereLeads.length,      active: !!HERE_API_KEY },
+      cnpj:          { count: cnpjLeads.length,      active: true },
+    }
+    console.log('[search/leads]', niche, city, JSON.stringify(sourceStats))
+
+    const all = [...overpassLeads, ...fsqLeads, ...yelpLeads, ...googleLeads, ...geoapifyLeads, ...hereLeads, ...cnpjLeads]
     if (!all.length) {
-      return sendJson(res, 502, { message: 'Nenhuma fonte retornou resultados. Tente novamente em instantes.' })
+      return sendJson(res, 502, {
+        message: 'Nenhuma fonte retornou resultados. Tente novamente em instantes.',
+        sources: sourceStats,
+      })
     }
 
     // Merge: deduplica por telefone, CNPJ ou nome/endereco e preserva todas as fontes.
@@ -2067,6 +2627,530 @@ async function handleApi(req, res, url) {
       engine: speech?.engine || null,
       requested_engine: speech?.requestedEngine || null,
     })
+  }
+
+  // ── PILOTO AUTOMÁTICO ────────────────────────────────────────────────────
+
+  if (url.pathname === '/api/autopilot/preview' && req.method === 'POST') {
+    const body = await readBody(req)
+    const niche = String(body.niche || '').toLowerCase().trim()
+    const city = String(body.city || '').trim()
+    const instanceId = String(body.instance_id || '').trim()
+    const limit = Math.min(Math.max(Number(body.limit || 30), 1), 80)
+    const aiPersonalize = body.ai_personalize !== false
+    const validateWhatsapp = body.validate_whatsapp !== false
+
+    if (!niche || !city) return sendJson(res, 400, { message: 'niche e city sao obrigatorios.' })
+    if (!instanceId) return sendJson(res, 400, { message: 'instance_id obrigatorio.' })
+
+    const instance = await findWhatsappInstanceById(instanceId)
+    if (!instance) return sendJson(res, 404, { message: 'Instancia WhatsApp nao encontrada.' })
+
+    const previewId = randomUUID()
+    const state = {
+      id: previewId,
+      kind: 'preview',
+      status: 'discovering',
+      stage: `Buscando leads em ${city}...`,
+      discovered: 0,
+      analyzed: 0,
+      messages_generated: 0,
+      whatsapp_valid: 0,
+      already_contacted: 0,
+      blocked: 0,
+      logs: [],
+      leads: [],
+      request: { niche, city, instance_id: instanceId, limit, ai_personalize: aiPersonalize },
+      started_at: new Date().toISOString(),
+    }
+    autopilotJobs.set(previewId, state)
+
+    try {
+      const log = msg => state.logs.push(msg)
+      log(`Buscando ${niche} em ${city}`)
+
+      const discovered = await discoverAutopilotLeads(niche, city, limit)
+      state.discovered = discovered.length
+      if (!discovered.length) {
+        state.status = 'error'
+        state.error = 'Nenhum lead com telefone encontrado.'
+        return sendJson(res, 404, state)
+      }
+
+      state.status = 'validating'
+      state.stage = 'Validando historico e WhatsApp...'
+      const phones = discovered.map(lead => lead.phone).filter(Boolean)
+      const contactFlags = await getLeadContactFlags(phones)
+      const whatsappMap = new Map()
+      if (validateWhatsapp && instance.evolution_instance_name) {
+        const waCheck = await checkWhatsAppNumbers(instance.evolution_instance_name, phones)
+        if (waCheck) {
+          for (const row of waCheck) {
+            const number = normalizePhone(row.number || row.jid || row.phone)
+            if (number) whatsappMap.set(number, row.exists === true ? 'valid' : 'invalid')
+          }
+        }
+      }
+
+      const enriched = []
+      state.status = aiPersonalize ? 'analyzing' : 'ready'
+      state.stage = aiPersonalize ? 'Analisando sites e gerando mensagens...' : 'Montando preview...'
+
+      for (const lead of discovered) {
+        const phone = normalizePhone(lead.phone)
+        const flags = contactFlags.get(phone) || {}
+        const whatsappStatus = whatsappMap.get(phone) || 'unknown'
+        const local = localLeadScore(lead, flags.already_contacted, whatsappStatus)
+        let siteContent = null
+        if (aiPersonalize && lead.website) {
+          siteContent = await analyzeWebsite(lead.website)
+          if (siteContent) state.analyzed += 1
+        }
+        const ai = aiPersonalize ? await enrichLeadWithAi(lead, siteContent, niche, city) : {
+          score_delta: 0,
+          intent: 'medio',
+          reason: 'Mensagem base gerada sem IA.',
+          message: baseAutopilotMessage(lead, niche, city),
+        }
+
+        const score = Math.max(0, Math.min(100, local.score + Number(ai.score_delta || 0)))
+        if (ai.message) state.messages_generated += 1
+        if (whatsappStatus === 'valid') state.whatsapp_valid += 1
+        if (flags.already_contacted) state.already_contacted += 1
+        if (flags.blocked) state.blocked += 1
+
+        enriched.push({
+          id: randomUUID(),
+          name: lead.name,
+          phone,
+          phone_type: lead.phone_type,
+          niche: lead.niche || niche,
+          city: lead.city || city,
+          address: lead.address || null,
+          website: lead.website || null,
+          cnpj: lead.cnpj || null,
+          email: lead.email || null,
+          source: lead.source || 'import',
+          sources: normalizeLeadSourceList(lead),
+          source_count: normalizeLeadSourceList(lead).length,
+          whatsapp_status: whatsappStatus,
+          already_contacted: Boolean(flags.already_contacted),
+          blocked: Boolean(flags.blocked),
+          lead_status: flags.lead_status || null,
+          score,
+          intent: ai.intent,
+          score_reasons: [...local.reasons, ai.reason].filter(Boolean),
+          message: ai.message || baseAutopilotMessage(lead, niche, city),
+          selected: !flags.blocked && !flags.already_contacted && whatsappStatus !== 'invalid' && score >= 35,
+          raw_payload: lead,
+        })
+      }
+
+      state.status = 'ready'
+      state.stage = `${enriched.filter(lead => lead.selected).length} leads prontos para revisao`
+      state.leads = enriched.sort((a, b) => b.score - a.score)
+      log('Preview pronto para revisao manual')
+      return sendJson(res, 200, state)
+    } catch (err) {
+      state.status = 'error'
+      state.error = err.message || 'Erro ao gerar preview.'
+      return sendJson(res, 500, state)
+    }
+  }
+
+  if (url.pathname === '/api/autopilot/send' && req.method === 'POST') {
+    const body = await readBody(req)
+    const previewId = String(body.preview_id || '').trim()
+    const approved = Array.isArray(body.approved_leads) ? body.approved_leads : []
+    const delayMin = Math.max(10, Number(body.delay_min_s || 30))
+    const delayMax = Math.max(delayMin, Number(body.delay_max_s || 90))
+    const dailyLimit = Math.min(Math.max(Number(body.daily_limit || approved.length || 1), 1), 50)
+
+    const preview = autopilotJobs.get(previewId)
+    if (!preview || preview.kind !== 'preview') return sendJson(res, 404, { message: 'Preview nao encontrado.' })
+    if (preview.status !== 'ready') return sendJson(res, 409, { message: 'Preview ainda nao esta pronto.' })
+    if (!approved.length) return sendJson(res, 400, { message: 'Nenhum lead aprovado para envio.' })
+
+    const instance = await findWhatsappInstanceById(preview.request.instance_id)
+    if (!instance) return sendJson(res, 404, { message: 'Instancia WhatsApp nao encontrada.' })
+
+    const approvedById = new Map(approved.map(item => [item.id, item]))
+    const selected = preview.leads
+      .filter(lead => approvedById.has(lead.id))
+      .map(lead => ({ ...lead, message: String(approvedById.get(lead.id)?.message || lead.message || '').trim() }))
+      .filter(lead => lead.message && !lead.blocked && !lead.already_contacted && lead.whatsapp_status !== 'invalid')
+      .slice(0, dailyLimit)
+
+    if (!selected.length) return sendJson(res, 400, { message: 'Nenhum lead aprovado passou pelas regras de seguranca.' })
+
+    const sendJobId = randomUUID()
+    const sendState = {
+      id: sendJobId,
+      preview_id: previewId,
+      kind: 'send',
+      status: 'creating',
+      stage: 'Criando campanha...',
+      total: selected.length,
+      sent: 0,
+      failed: 0,
+      skipped: 0,
+      campaign_id: null,
+      logs: [],
+      started_at: new Date().toISOString(),
+    }
+    autopilotJobs.set(sendJobId, sendState)
+
+    ;(async () => {
+      const log = msg => { sendState.logs.push(msg); console.log('[autopilot-send]', msg) }
+      try {
+        const { niche, city } = preview.request
+        const campaignPayload = {
+          id: randomUUID(),
+          name: `Piloto revisado - ${niche} - ${city} - ${new Date().toLocaleDateString('pt-BR')}`,
+          niche,
+          city,
+          template_id: null,
+          status: 'running',
+          quantity_requested: selected.length,
+          daily_limit: selected.length,
+          delay_min_s: delayMin,
+          delay_max_s: delayMax,
+          use_audio: false,
+          started_at: new Date().toISOString(),
+        }
+        let campR = await supabaseRequest('/campaigns', { method: 'POST', body: JSON.stringify(campaignPayload) })
+        if (!campR.ok && isMissingColumn(campR)) {
+          const minimalPayload = { ...campaignPayload }
+          delete minimalPayload.use_audio
+          delete minimalPayload.neighborhood
+          campR = await supabaseRequest('/campaigns', { method: 'POST', body: JSON.stringify(minimalPayload) })
+        }
+        if (!campR.ok && isMissingColumn(campR)) {
+          campR = await supabaseRequest('/campaigns', { method: 'POST', body: JSON.stringify(campaignPatchPayload(campaignPayload, true)) })
+        }
+        if (!campR.ok) throw new Error(campR.data?.message || 'Erro ao criar campanha.')
+        const campaign = Array.isArray(campR.data) ? campR.data[0] : campR.data
+        sendState.campaign_id = campaign.id
+        sendState.status = 'sending'
+        sendState.stage = `Enviando 0/${selected.length}`
+
+        for (const item of selected) {
+          const phone = normalizePhone(item.phone)
+          const flags = await getLeadContactFlags([phone])
+          const flag = flags.get(phone)
+          if (flag?.blocked || flag?.already_contacted) {
+            sendState.skipped += 1
+            log(`Ignorado por historico: ${item.name}`)
+            continue
+          }
+
+          const leadRecord = await ensureLeadRecordFromPreview({ ...item, preview_id: previewId }, niche, city)
+          if (!leadRecord?.id) {
+            sendState.failed += 1
+            log(`Falha ao salvar lead: ${item.name}`)
+            continue
+          }
+
+          const clRes = await createCampaignLead({
+            campaign_id: campaign.id,
+            lead_id: leadRecord.id,
+            status: 'pending',
+            scheduled_at: new Date().toISOString(),
+          })
+          const clId = clRes.data?.[0]?.id
+
+          const msgRecord = await insertMessage({
+            lead_id: leadRecord.id,
+            whatsapp_instance_id: instance.id,
+            campaign_id: campaign.id,
+            direction: 'outbound',
+            kind: 'text',
+            phone,
+            body: item.message,
+            status: 'pending',
+            raw_payload: { source: 'autopilot_reviewed', preview_id: previewId, score: item.score },
+          })
+
+          let result
+          try {
+            result = await evolutionRequest(`/message/sendText/${encodeURIComponent(instance.evolution_instance_name)}`, {
+              method: 'POST',
+              body: JSON.stringify({ number: phone, text: item.message }),
+            })
+          } catch (err) {
+            result = { ok: false, data: { message: err.message } }
+          }
+
+          const ok = Boolean(result.ok)
+          sendState.sent += ok ? 1 : 0
+          sendState.failed += ok ? 0 : 1
+
+          if (msgRecord?.id) {
+            await supabaseRequest(`/messages?id=eq.${encodeURIComponent(msgRecord.id)}`, {
+              method: 'PATCH',
+              body: JSON.stringify(ok
+                ? { status: 'sent', provider_message_id: result.data?.key?.id || null, sent_at: new Date().toISOString() }
+                : { status: 'failed', error_message: result.data?.message || 'Falha no envio' }),
+            })
+          }
+          await updateCampaignLead(clId, {
+            status: ok ? 'sent' : 'failed',
+            message_id: msgRecord?.id || null,
+            sent_at: new Date().toISOString(),
+            error: ok ? null : result.data?.message || 'Falha no envio',
+          })
+          if (ok) {
+            await incrementInstanceSentToday(instance.id, Number(instance.sent_today || 0) + sendState.sent - 1)
+            await supabaseRequest(`/leads?id=eq.${encodeURIComponent(leadRecord.id)}`, {
+              method: 'PATCH',
+              body: JSON.stringify({ status: 'sent', last_interaction_at: new Date().toISOString() }),
+            })
+          }
+          await patchCampaign(campaign.id, { sent_count: sendState.sent, failed_count: sendState.failed })
+          sendState.stage = `Enviando ${sendState.sent + sendState.failed + sendState.skipped}/${selected.length}`
+          log(`${ok ? 'Enviado' : 'Falhou'}: ${item.name} | ${phone}`)
+
+          const delay = (delayMin + Math.random() * (delayMax - delayMin)) * 1000
+          await new Promise(resolve => setTimeout(resolve, delay))
+        }
+
+        sendState.status = 'done'
+        sendState.stage = `Concluido: ${sendState.sent} enviados, ${sendState.failed} falhas, ${sendState.skipped} ignorados`
+        await patchCampaign(campaign.id, {
+          status: 'finished',
+          finished_at: new Date().toISOString(),
+          sent_count: sendState.sent,
+          failed_count: sendState.failed,
+        })
+        log('Envio revisado concluido')
+      } catch (err) {
+        sendState.status = 'error'
+        sendState.error = err.message || 'Erro no envio.'
+        log(`Erro: ${sendState.error}`)
+      }
+    })()
+
+    return sendJson(res, 202, { autopilot_id: sendJobId, status: 'running', total: selected.length })
+  }
+
+  if (url.pathname === '/api/autopilot/start' && req.method === 'POST') {
+    return sendJson(res, 410, { message: 'O disparo direto foi desativado. Use /api/autopilot/preview e depois /api/autopilot/send.' })
+    const body = await readBody(req)
+    const niche       = (body.niche || '').toLowerCase().trim()
+    const city        = (body.city || '').trim()
+    const instanceId  = body.instance_id || ''
+    const templateId  = body.template_id || null
+    const limit       = Math.min(Number(body.limit || 30), 100)
+    const aiPersonalize = body.ai_personalize !== false
+    const useAudio    = !!body.use_audio
+    const delayMin    = Number(body.delay_min_s || 30)
+    const delayMax    = Number(body.delay_max_s || 90)
+
+    if (!niche || !city)  return sendJson(res, 400, { message: 'niche e city obrigatórios.' })
+    if (!instanceId)      return sendJson(res, 400, { message: 'instance_id obrigatório.' })
+
+    const jobId = randomUUID()
+    const state = {
+      id: jobId, status: 'discovering',
+      stage: `Buscando empresas em ${city}...`,
+      discovered: 0, imported: 0, analyzed: 0,
+      messages_generated: 0, sent: 0, failed: 0,
+      campaign_id: null, error: null, logs: [],
+      started_at: new Date().toISOString(),
+    }
+    autopilotJobs.set(jobId, state)
+
+    // Roda em background — responde imediatamente com o job ID
+    ;(async () => {
+      const log = msg => { state.logs.push(msg); console.log('[autopilot]', msg) }
+      try {
+        // ── 1. Descobrir leads ───────────────────────────────────────────
+        log(`🔍 Buscando ${niche} em ${city}...`)
+        const sources = await Promise.allSettled([
+          fetchOverpassLeads(niche, city, limit),
+          fetchFoursquareLeads(niche, city, limit),
+          fetchYelpLeads(niche, city, limit),
+          fetchGooglePlacesLeads(niche, city, limit),
+          fetchGeoapifyLeads(niche, city, limit),
+          fetchHERELeads(niche, city, limit),
+          fetchCNPJLeads(niche, city, limit),
+        ])
+        const raw = sources.flatMap(s => s.status === 'fulfilled' ? s.value : [])
+
+        // Deduplica e filtra só leads com telefone
+        const leadMap = new Map()
+        for (const l of raw) {
+          const norm = { ...l, phone: normalizePhone(l.phone) || null }
+          const key  = discoveryKey(norm)
+          leadMap.set(key, mergeLeadRecords(leadMap.get(key), norm))
+        }
+        const discovered = [...leadMap.values()]
+          .map(l => ({ ...l, quality_score: discoveryQuality(l) }))
+          .sort((a, b) => b.quality_score - a.quality_score)
+          .filter(l => l.phone)
+          .slice(0, limit)
+
+        state.discovered = discovered.length
+        log(`✅ ${discovered.length} leads encontrados com telefone`)
+        if (!discovered.length) {
+          state.status = 'error'; state.error = 'Nenhum lead com telefone encontrado.'; return
+        }
+
+        // ── 2. Importar leads para o banco ───────────────────────────────
+        state.status = 'importing'; state.stage = 'Importando leads...'
+        const leads = []
+        for (const l of discovered) {
+          await supabaseRequest('/leads', {
+            method: 'POST',
+            headers: { Prefer: 'return=minimal,resolution=ignore-duplicates' },
+            body: JSON.stringify({
+              id: randomUUID(), name: l.name, phone: l.phone, normalized_phone: l.phone,
+              niche: l.niche || niche, city: l.city || city, address: l.address || null,
+              website: l.website || null, cnpj: l.cnpj || null, email: l.email || null,
+              source: l.source || 'overpass', status: 'new', raw_payload: l,
+            }),
+          })
+          // Busca o registro real (novo ou já existente)
+          const q = await supabaseRequest(`/leads?normalized_phone=eq.${encodeURIComponent(l.phone)}&select=id,website,status&limit=1`)
+          if (q.ok && Array.isArray(q.data) && q.data[0]) {
+            const db = q.data[0]
+            if (!['opt_out', 'invalid'].includes(db.status)) {
+              leads.push({ ...l, id: db.id, website: l.website || db.website })
+            }
+          }
+        }
+        state.imported = leads.length
+        log(`📥 ${leads.length} leads importados`)
+
+        // ── 3. Buscar template base ──────────────────────────────────────
+        let baseTemplate = 'Olá {nome_empresa}! Vi que vocês atuam com {nicho} em {cidade} e gostaria de apresentar uma solução que pode ajudar no crescimento do negócio. Podemos conversar?'
+        if (templateId) {
+          const tR = await supabaseRequest(`/message_templates?id=eq.${templateId}&select=body&limit=1`)
+          if (tR.ok && Array.isArray(tR.data) && tR.data[0]) baseTemplate = tR.data[0].body
+        }
+
+        // ── 4. Análise de site + personalização com IA ───────────────────
+        if (aiPersonalize && GROQ_API_KEY) {
+          state.status = 'analyzing'; state.stage = 'Analisando sites com IA...'
+          for (const lead of leads) {
+            if (lead.website) {
+              const content = await analyzeWebsite(lead.website)
+              if (content) state.analyzed++
+              const base = interpolateTemplate(baseTemplate, lead, niche, city)
+              const aiMsg = await generatePersonalizedMessage(lead, content, base)
+              if (aiMsg) {
+                lead.ai_message = aiMsg
+                state.messages_generated++
+                await supabaseRequest(`/leads?id=eq.${lead.id}`, {
+                  method: 'PATCH',
+                  body: JSON.stringify({ raw_payload: { ...(lead.raw_payload || {}), ai_message: aiMsg } }),
+                })
+                log(`🤖 Mensagem gerada: ${lead.name}`)
+              }
+            }
+          }
+        } else if (aiPersonalize && !GROQ_API_KEY) {
+          log('⚠️  GROQ_API_KEY não configurada — usando template padrão')
+        }
+
+        // ── 5. Criar campanha ────────────────────────────────────────────
+        state.status = 'creating'; state.stage = 'Criando campanha...'
+        const campName = `Piloto Auto · ${niche} · ${city} · ${new Date().toLocaleDateString('pt-BR')}`
+        const campR = await supabaseRequest('/campaigns', {
+          method: 'POST',
+          headers: { Prefer: 'return=representation' },
+          body: JSON.stringify({
+            id: randomUUID(), name: campName, niche, city,
+            template_id: templateId || null, status: 'running',
+            quantity_requested: leads.length, daily_limit: leads.length,
+            delay_min_s: delayMin, delay_max_s: delayMax,
+            use_audio: useAudio, started_at: new Date().toISOString(),
+          }),
+        })
+        if (!campR.ok) { state.status = 'error'; state.error = 'Erro ao criar campanha.'; return }
+        const campaign = Array.isArray(campR.data) ? campR.data[0] : campR.data
+        state.campaign_id = campaign.id
+
+        // ── 6. Buscar instância WhatsApp ─────────────────────────────────
+        const instR = await supabaseRequest(`/whatsapp_instances?id=eq.${instanceId}&select=*&limit=1`)
+        if (!instR.ok || !instR.data?.[0]) { state.status = 'error'; state.error = 'Instância WhatsApp não encontrada.'; return }
+        const instance = instR.data[0]
+
+        // ── 7. Disparar mensagens gradativamente ─────────────────────────
+        state.status = 'sending'; state.stage = 'Enviando mensagens...'
+        for (const lead of leads) {
+          if (!lead.phone) continue
+          const msgBody = lead.ai_message || interpolateTemplate(baseTemplate, lead, niche, city)
+
+          const msgR = await supabaseRequest('/messages', {
+            method: 'POST',
+            headers: { Prefer: 'return=representation' },
+            body: JSON.stringify({
+              id: randomUUID(), lead_id: lead.id, whatsapp_instance_id: instanceId,
+              campaign_id: campaign.id, direction: 'outbound', kind: 'text',
+              phone: lead.phone, body: msgBody, status: 'pending',
+            }),
+          })
+          const msg = msgR.ok ? (Array.isArray(msgR.data) ? msgR.data[0] : msgR.data) : null
+
+          let ok = false
+          try {
+            const sr = await evolutionRequest(
+              `/message/sendText/${encodeURIComponent(instance.evolution_instance_name)}`,
+              { method: 'POST', body: JSON.stringify({ number: lead.phone, text: msgBody }) },
+            )
+            ok = sr.ok
+          } catch { /* ignora erro de envio individual */ }
+
+          if (ok) {
+            state.sent++
+            await supabaseRequest(`/leads?id=eq.${lead.id}`, {
+              method: 'PATCH',
+              body: JSON.stringify({ status: 'sent', last_interaction_at: new Date().toISOString() }),
+            })
+          } else {
+            state.failed++
+          }
+          if (msg?.id) {
+            await supabaseRequest(`/messages?id=eq.${msg.id}`, {
+              method: 'PATCH',
+              body: JSON.stringify({ status: ok ? 'sent' : 'failed', sent_at: ok ? new Date().toISOString() : null }),
+            })
+          }
+          await supabaseRequest(`/campaigns?id=eq.${campaign.id}`, {
+            method: 'PATCH',
+            body: JSON.stringify({ sent_count: state.sent, failed_count: state.failed }),
+          })
+          log(`${ok ? '✅' : '❌'} ${lead.name} | ${lead.phone}`)
+          state.stage = `Enviando... ${state.sent + state.failed}/${leads.length}`
+
+          const delay = (delayMin + Math.random() * (delayMax - delayMin)) * 1000
+          await new Promise(r => setTimeout(r, delay))
+        }
+
+        // ── 8. Finalizar ─────────────────────────────────────────────────
+        state.status = 'done'
+        state.stage  = `Concluído! ${state.sent} enviados · ${state.failed} falhas`
+        await supabaseRequest(`/campaigns?id=eq.${campaign.id}`, {
+          method: 'PATCH',
+          body: JSON.stringify({ status: 'finished', finished_at: new Date().toISOString(), sent_count: state.sent, failed_count: state.failed }),
+        })
+        log('🎉 Piloto automático concluído!')
+
+      } catch (err) {
+        state.status = 'error'; state.error = err.message
+        log('💥 Erro fatal: ' + err.message)
+      }
+    })()
+
+    return sendJson(res, 200, { autopilot_id: jobId, status: 'running' })
+  }
+
+  if (url.pathname.startsWith('/api/autopilot/') && url.pathname.endsWith('/status') && req.method === 'GET') {
+    const jobId = url.pathname.split('/')[3]
+    const state = autopilotJobs.get(jobId)
+    if (!state) return sendJson(res, 404, { message: 'Job não encontrado.' })
+    return sendJson(res, 200, state)
   }
 
   return sendJson(res, 404, { message: 'Rota nao encontrada.' })

@@ -4,7 +4,8 @@ import { icons } from './icons.js'
 /* ── TABS ── */
 
 const tabs = [
-  { id: 'dashboard',    label: 'Dashboard',    icon: 'dashboard' },
+  { id: 'autopilot',   label: 'Piloto Auto',   icon: 'autopilot' },
+  { id: 'dashboard',   label: 'Dashboard',     icon: 'dashboard' },
   { id: 'campaigns',   label: 'Campanhas',     icon: 'campaigns' },
   { id: 'leads',       label: 'Leads',         icon: 'leads' },
   { id: 'inbox',       label: 'Inbox',         icon: 'inbox' },
@@ -17,6 +18,7 @@ const tabs = [
 ]
 
 const viewModules = {
+  autopilot:    () => import('./views/autopilot.js'),
   dashboard:    () => import('./views/dashboard.js'),
   campaigns:    () => import('./views/campaigns.js'),
   leads:        () => import('./views/leads.js'),

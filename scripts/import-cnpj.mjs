@@ -19,7 +19,7 @@ import { request as httpRequest } from 'node:http'
 import zlib from 'node:zlib'
 import { createInterface } from 'node:readline'
 import { PassThrough } from 'node:stream'
-import { existsSync, readFileSync } from 'node:fs'
+import { existsSync, readFileSync, createReadStream } from 'node:fs'
 
 // ── Env ───────────────────────────────────────────────────────────────────
 
@@ -72,9 +72,11 @@ function getArg(flag, def = null) {
   return i >= 0 && i + 1 < process.argv.length ? process.argv[i + 1] : def
 }
 
-const monthArg = getArg('--month')
-const fileArg  = getArg('--file')
-const FILES    = fileArg !== null ? [Number(fileArg)] : [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+const monthArg    = getArg('--month')
+const fileArg     = getArg('--file')
+const localZip    = getArg('--local-zip')    // caminho p/ Estabelecimentos0.zip local
+const localMun    = getArg('--local-mun')    // caminho p/ Municipios.zip local (opcional)
+const FILES       = fileArg !== null ? [Number(fileArg)] : [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
 
 // ── HTTP helper com redirect ──────────────────────────────────────────────
 
@@ -240,7 +242,12 @@ async function marcarErro(mes, arquivo, total, importadas) {
 
 async function loadMunicipios(baseUrl) {
   process.stdout.write('Carregando municípios... ')
-  const res    = await fetchStream(`${baseUrl}/Municipios.zip`)
+  let res
+  if (localMun && existsSync(localMun)) {
+    res = createReadStream(localMun)
+  } else {
+    res = await fetchStream(`${baseUrl}/Municipios.zip`)
+  }
   const stream = await extractFirstFileFromZip(res)
   stream.setEncoding('latin1')
 
@@ -283,11 +290,18 @@ async function processFile(baseUrl, mes, fileIdx, municipios) {
   }
 
   let res
-  try {
-    res = await fetchStream(url)
-  } catch (err) {
-    console.error(`  Erro ao baixar: ${err.message}`)
-    return 0
+  // Suporte a arquivo local via --local-zip
+  if (localZip && existsSync(localZip)) {
+    console.log(`  Usando arquivo local: ${localZip}`)
+    res = createReadStream(localZip)
+  } else {
+    try {
+      res = await fetchStream(url)
+    } catch (err) {
+      console.error(`  Erro ao baixar: ${err.message}`)
+      console.error(`  Dica: baixe o arquivo manualmente e use --local-zip caminho/Estabelecimentos${fileIdx}.zip`)
+      return 0
+    }
   }
 
   await marcarInicio(mes, fileIdx)
@@ -356,16 +370,29 @@ async function processFile(baseUrl, mes, fileIdx, municipios) {
 // ── Main ──────────────────────────────────────────────────────────────────
 
 async function main() {
-  const now   = new Date()
-  const month = monthArg || `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}`
+  const now = new Date()
+  // A Receita Federal publica com ~1 mês de atraso — usa mês anterior por padrão
+  const defaultMonth = monthArg || (() => {
+    const d = new Date(now.getFullYear(), now.getMonth() - 1, 1)
+    return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`
+  })()
+  const month = defaultMonth
   const base  = `https://dados.rfb.gov.br/CNPJ/dados_abertos_cnpj/${month}`
 
   console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━')
   console.log('  Importação CNPJ — Receita Federal')
   console.log(`  Mês: ${month}`)
-  console.log(`  Arquivos: ${FILES.join(', ')}  (0–9 = 100% do Brasil)`)
+  if (localZip) console.log(`  Arquivo local: ${localZip}`)
+  if (localMun) console.log(`  Municípios local: ${localMun}`)
+  if (!localZip) console.log(`  Arquivos: ${FILES.join(', ')}  (0–9 = 100% do Brasil)`)
   console.log(`  CNAEs alvo: ${TARGET_CNAES.size} códigos`)
   if (FORCE) console.log('  Modo: --force (re-importa mesmo já feitos)')
+  if (!localZip) {
+    console.log('\n  Se der erro de conexão, baixe os arquivos manualmente:')
+    console.log(`  Municípios: ${base}/Municipios.zip`)
+    console.log(`  Dados:      ${base}/Estabelecimentos0.zip`)
+    console.log('  Depois rode: node scripts/import-cnpj.mjs --local-zip Estabelecimentos0.zip --local-mun Municipios.zip')
+  }
   console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n')
 
   const municipios = await loadMunicipios(base)
