@@ -2,6 +2,7 @@ import http from 'node:http'
 import { existsSync, readFileSync } from 'node:fs'
 import { URL } from 'node:url'
 import { randomUUID } from 'node:crypto'
+import { execSync } from 'node:child_process'
 
 function loadEnvFile(file) {
   if (!existsSync(file)) return
@@ -34,13 +35,17 @@ const TTS_SERVER_URL = (process.env.TTS_SERVER_URL || '').replace(/\/$/, '')
 const TTS_VOICE = process.env.TTS_VOICE || 'pf_dora'
 const GROQ_API_KEY = process.env.GROQ_API_KEY || ''
 const HOT_LEAD_SCORE = Number(process.env.HOT_LEAD_SCORE || 70)
-const GROQ_MODEL = 'llama-3.1-70b-versatile'
+const GROQ_MODEL = process.env.GROQ_MODEL || 'llama-3.1-70b-versatile'
+const GROQ_COPY_REVIEW = process.env.GROQ_COPY_REVIEW !== 'false'
+const LEAD_AGENT_MAX_SENDS_PER_DAY_SOFT = Number(process.env.LEAD_AGENT_MAX_SENDS_PER_DAY_SOFT || 20)
 
 const ALLOWED_ORIGINS = new Set([
   process.env.CORS_ORIGIN || 'http://127.0.0.1:5173',
+  'http://127.0.0.1:3001',
   'http://127.0.0.1:5173',
   'http://127.0.0.1:5174',
   'http://127.0.0.1:5175',
+  'http://localhost:3001',
   'http://localhost:5173',
   'http://localhost:5174',
   'http://localhost:5175',
@@ -51,10 +56,31 @@ function _sendJson(res, status, data, reqOrigin) {
   res.writeHead(status, {
     'Content-Type': 'application/json; charset=utf-8',
     'Access-Control-Allow-Origin': origin,
-    'Access-Control-Allow-Methods': 'GET,POST,PUT,DELETE,OPTIONS',
+    'Access-Control-Allow-Methods': 'GET,POST,PUT,PATCH,DELETE,OPTIONS',
     'Access-Control-Allow-Headers': 'Content-Type',
   })
   res.end(JSON.stringify(data))
+}
+
+function detectListeningPid(port) {
+  try {
+    if (process.platform === 'win32') {
+      const out = execSync(`netstat -ano -p tcp | findstr :${port}`, { stdio: ['ignore', 'pipe', 'ignore'] }).toString()
+      const line = out
+        .split(/\r?\n/)
+        .map(value => value.trim())
+        .find(value => value && /LISTENING/i.test(value) && new RegExp(`:${port}\\s`).test(value))
+      if (!line) return null
+      const parts = line.split(/\s+/)
+      const pid = Number(parts[parts.length - 1])
+      return Number.isFinite(pid) ? pid : null
+    }
+    const out = execSync(`lsof -nP -iTCP:${port} -sTCP:LISTEN -t`, { stdio: ['ignore', 'pipe', 'ignore'] }).toString().trim()
+    const pid = Number(out.split(/\r?\n/)[0])
+    return Number.isFinite(pid) ? pid : null
+  } catch {
+    return null
+  }
 }
 
 function readBody(req) {
@@ -267,7 +293,7 @@ function isMissingColumn(result) {
 }
 
 function isMissingRelation(result) {
-  return result?.data?.code === '42P01'
+  return result?.data?.code === '42P01' || result?.data?.code === 'PGRST205'
 }
 
 function isCheckViolation(result) {
@@ -1256,6 +1282,927 @@ async function fetchCNPJLeads(niche, city, limit) {
 
 // Estado em memória dos jobs (perdido ao reiniciar — proposital, é ephemeral)
 const autopilotJobs = new Map()
+const leadAutomationAgents = new Map()
+const messageQualityAudits = []
+
+const LEAD_AGENT_DEFAULTS = {
+  niche: '',
+  city: '',
+  instance_id: '',
+  sequence_id: '',
+  interval_minutes: 180,
+  limit_per_term: 30,
+  max_terms: 8,
+  max_new_leads_per_cycle: 20,
+  min_score: 45,
+  auto_approve_score: 70,
+  auto_send: true,
+  daily_send_limit: 12,
+  delay_min_s: 45,
+  delay_max_s: 90,
+  enable_follow_up: true,
+  follow_up_after_hours: 48,
+  ai_personalize: false,
+}
+
+const LEAD_NICHE_SYNONYMS = {
+  odontologia: ['dentista', 'clinica odontologica', 'consultorio odontologico', 'ortodontia', 'implante dentario'],
+  dentista: ['odontologia', 'clinica odontologica', 'consultorio odontologico', 'ortodontia'],
+  restaurante: ['restaurante delivery', 'comida caseira', 'bistro', 'lanchonete', 'self service'],
+  advocacia: ['advogado', 'escritorio de advocacia', 'consultoria juridica'],
+  contabilidade: ['contador', 'escritorio contabil', 'contabilidade empresarial'],
+  academia: ['studio fitness', 'crossfit', 'pilates', 'musculacao'],
+  estetica: ['clinica estetica', 'harmonizacao facial', 'depilacao a laser', 'spa'],
+}
+
+function normalizeLeadAgentConfig(body = {}, currentConfig = {}) {
+  return {
+    ...LEAD_AGENT_DEFAULTS,
+    ...currentConfig,
+    niche: String(body.niche || currentConfig.niche || '').trim().toLowerCase(),
+    city: String(body.city || currentConfig.city || '').trim(),
+    instance_id: String(body.instance_id || currentConfig.instance_id || '').trim(),
+    sequence_id: String(body.sequence_id || currentConfig.sequence_id || '').trim(),
+    interval_minutes: Math.max(15, Number(body.interval_minutes || currentConfig.interval_minutes || LEAD_AGENT_DEFAULTS.interval_minutes)),
+    limit_per_term: Math.min(80, Math.max(5, Number(body.limit_per_term || currentConfig.limit_per_term || LEAD_AGENT_DEFAULTS.limit_per_term))),
+    max_terms: Math.min(12, Math.max(2, Number(body.max_terms || currentConfig.max_terms || LEAD_AGENT_DEFAULTS.max_terms))),
+    max_new_leads_per_cycle: Math.min(60, Math.max(1, Number(body.max_new_leads_per_cycle || currentConfig.max_new_leads_per_cycle || LEAD_AGENT_DEFAULTS.max_new_leads_per_cycle))),
+    min_score: Math.min(100, Math.max(10, Number(body.min_score || currentConfig.min_score || LEAD_AGENT_DEFAULTS.min_score))),
+    auto_approve_score: Math.min(100, Math.max(20, Number(body.auto_approve_score || currentConfig.auto_approve_score || LEAD_AGENT_DEFAULTS.auto_approve_score))),
+    auto_send: body.auto_send !== false,
+    daily_send_limit: Math.min(50, Math.max(1, Number(body.daily_send_limit || currentConfig.daily_send_limit || LEAD_AGENT_DEFAULTS.daily_send_limit))),
+    delay_min_s: Math.max(10, Number(body.delay_min_s || currentConfig.delay_min_s || LEAD_AGENT_DEFAULTS.delay_min_s)),
+    delay_max_s: Math.max(Number(body.delay_min_s || currentConfig.delay_min_s || LEAD_AGENT_DEFAULTS.delay_min_s), Number(body.delay_max_s || currentConfig.delay_max_s || LEAD_AGENT_DEFAULTS.delay_max_s)),
+    ai_personalize: body.ai_personalize !== false,
+  }
+}
+
+function trimArrayUnique(values = [], limit = 12) {
+  const seen = new Set()
+  const result = []
+  for (const value of values) {
+    const normalized = String(value || '').trim().toLowerCase()
+    if (!normalized || seen.has(normalized)) continue
+    seen.add(normalized)
+    result.push(normalized)
+    if (result.length >= limit) break
+  }
+  return result
+}
+
+function splitNicheVariants(niche = '') {
+  const base = String(niche || '').trim().toLowerCase()
+  if (!base) return []
+  const variants = [base]
+  for (const token of base.split(/[\/,|-]+/).map(part => part.trim()).filter(Boolean)) {
+    variants.push(token)
+  }
+  for (const [key, values] of Object.entries(LEAD_NICHE_SYNONYMS)) {
+    if (base.includes(key) || key.includes(base)) variants.push(...values)
+  }
+  return trimArrayUnique(variants, 10)
+}
+
+async function suggestLeadSearchTerms(niche, city, maxTerms = 8) {
+  const fallback = splitNicheVariants(niche)
+  if (!GROQ_API_KEY) return fallback.slice(0, maxTerms)
+  try {
+    const completion = await groqChat([
+      {
+        role: 'system',
+        content: 'Voce cria variacoes curtas de busca para prospeccao local no Brasil. Responda SOMENTE JSON valido no formato {"terms":["..."],"notes":"..."}.',
+      },
+      {
+        role: 'user',
+        content: `Nicho base: ${niche}\nCidade: ${city}\nGere ate ${maxTerms} variacoes curtas e comerciais para buscar empresas locais, incluindo sinonimos e formas que apareceriam em Google Places.`,
+      },
+    ], { temperature: 0.2, maxTokens: 220 })
+    const parsed = JSON.parse(completion)
+    return trimArrayUnique([niche, ...(parsed?.terms || []), ...fallback], maxTerms)
+  } catch {
+    return fallback.slice(0, maxTerms)
+  }
+}
+
+function createLeadAutomationState(config = {}) {
+  return {
+    id: 'lead-agent',
+    kind: 'lead-automation',
+    active: false,
+    running: false,
+    status: 'idle',
+    stage: 'Aguardando ativacao.',
+    config: { ...LEAD_AGENT_DEFAULTS, ...config },
+    stats: {
+      cycles: 0,
+      discovered: 0,
+      imported: 0,
+      auto_approved: 0,
+      skipped_existing: 0,
+      blocked: 0,
+    },
+    last_run_at: null,
+    next_run_at: null,
+    last_terms: [],
+    last_cycle: null,
+    recent_cycles: [],
+    logs: [],
+    timer: null,
+    started_at: null,
+    error: null,
+  }
+}
+
+function appendLeadAgentLog(agent, message) {
+  agent.logs.unshift(`${new Date().toLocaleString('pt-BR')} - ${message}`)
+  agent.logs = agent.logs.slice(0, 60)
+}
+
+function serializeLeadAutomationState(agent) {
+  return {
+    id: agent.id,
+    kind: agent.kind,
+    active: agent.active,
+    running: agent.running,
+    status: agent.status,
+    stage: agent.stage,
+    config: agent.config,
+    stats: agent.stats,
+    last_run_at: agent.last_run_at,
+    next_run_at: agent.next_run_at,
+    last_terms: agent.last_terms,
+    last_cycle: agent.last_cycle,
+    recent_cycles: Array.isArray(agent.recent_cycles) ? agent.recent_cycles.slice(0, 20) : [],
+    safety: {
+      soft_limit_per_day: LEAD_AGENT_MAX_SENDS_PER_DAY_SOFT,
+    },
+    logs: agent.logs,
+    started_at: agent.started_at,
+    error: agent.error,
+  }
+}
+
+function getLeadAutomationAgent() {
+  if (!leadAutomationAgents.has('lead-agent')) {
+    leadAutomationAgents.set('lead-agent', createLeadAutomationState())
+  }
+  return leadAutomationAgents.get('lead-agent')
+}
+
+async function loadLeadAutomationAgentFromDb(agentId = 'lead-agent') {
+  const result = await supabaseRequest(`/automation_agents?id=eq.${encodeURIComponent(agentId)}&select=*&limit=1`)
+  if (!result.ok) return isMissingRelation(result) ? null : null
+  return Array.isArray(result.data) ? result.data[0] || null : null
+}
+
+async function persistLeadAutomationAgent(agent) {
+  const payload = {
+    id: agent.id,
+    kind: agent.kind,
+    active: Boolean(agent.active),
+    config: agent.config,
+    state: {
+      status: agent.status,
+      stage: agent.stage,
+      stats: agent.stats,
+      last_terms: agent.last_terms,
+      last_cycle: agent.last_cycle,
+      recent_cycles: Array.isArray(agent.recent_cycles) ? agent.recent_cycles.slice(0, 20) : [],
+      logs: agent.logs,
+      error: agent.error,
+    },
+    last_run_at: agent.last_run_at,
+    next_run_at: agent.next_run_at,
+    started_at: agent.started_at,
+  }
+  const result = await supabaseRequest('/automation_agents?on_conflict=id', {
+    method: 'POST',
+    headers: { Prefer: 'resolution=merge-duplicates,return=representation' },
+    body: JSON.stringify(payload),
+  })
+  return isMissingRelation(result) ? null : result.data?.[0] || null
+}
+
+async function restoreLeadAutomationAgents() {
+  const record = await loadLeadAutomationAgentFromDb('lead-agent')
+  if (!record) return
+  const agent = getLeadAutomationAgent()
+  agent.active = Boolean(record.active)
+  agent.config = { ...LEAD_AGENT_DEFAULTS, ...(record.config || {}) }
+  agent.status = record.state?.status || (agent.active ? 'active' : 'idle')
+  agent.stage = record.state?.stage || (agent.active ? 'Retomado no boot.' : 'Aguardando ativacao.')
+  agent.stats = { ...agent.stats, ...(record.state?.stats || {}) }
+  agent.last_terms = Array.isArray(record.state?.last_terms) ? record.state.last_terms : []
+  agent.last_cycle = record.state?.last_cycle || null
+  agent.recent_cycles = Array.isArray(record.state?.recent_cycles) ? record.state.recent_cycles.slice(0, 20) : []
+  agent.logs = Array.isArray(record.state?.logs) ? record.state.logs.slice(0, 60) : []
+  agent.last_run_at = record.last_run_at || null
+  agent.next_run_at = record.next_run_at || null
+  agent.started_at = record.started_at || null
+  agent.error = record.state?.error || null
+  if (agent.active) {
+    appendLeadAgentLog(agent, 'Agente retomado automaticamente no boot.')
+    const nextRun = agent.next_run_at ? new Date(agent.next_run_at).getTime() : 0
+    scheduleLeadAutomation(agent, { runImmediately: !nextRun || nextRun <= Date.now() })
+  }
+}
+
+async function persistAndSerializeLeadAgent(agent) {
+  await persistLeadAutomationAgent(agent)
+  return serializeLeadAutomationState(agent)
+}
+
+async function persistAutomationCycleRun(agent, cycle = {}) {
+  const payload = {
+    agent_id: agent.id,
+    cycle_id: cycle.id || null,
+    started_at: cycle.started_at || null,
+    finished_at: cycle.finished_at || new Date().toISOString(),
+    niche: agent.config?.niche || null,
+    city: agent.config?.city || null,
+    discovered: Number(cycle.discovered || 0),
+    imported: Number(cycle.imported || 0),
+    auto_approved: Number(cycle.auto_approved || 0),
+    skipped_existing: Number(cycle.skipped_existing || 0),
+    blocked: Number(cycle.blocked || 0),
+    below_score: Number(cycle.below_score || 0),
+    dispatched: Number(cycle.dispatched || 0),
+    dispatch_failed: Number(cycle.dispatch_failed || 0),
+    followed_up: Number(cycle.followed_up || 0),
+    terms: cycle.terms || [],
+    imported_preview: cycle.imported_preview || [],
+    meta: cycle.meta || {},
+  }
+  const result = await supabaseRequest('/automation_cycle_runs', {
+    method: 'POST',
+    body: JSON.stringify(payload),
+  })
+  return result.ok ? (Array.isArray(result.data) ? result.data[0] : result.data) : null
+}
+
+async function loadRecentAutomationCycleRuns(agentId, limit = 20) {
+  const result = await supabaseRequest(`/automation_cycle_runs?agent_id=eq.${encodeURIComponent(agentId)}&select=id,cycle_id,started_at,finished_at,niche,city,discovered,imported,auto_approved,skipped_existing,blocked,below_score,dispatched,dispatch_failed,followed_up,terms,imported_preview,meta&order=finished_at.desc&limit=${Math.max(1, Math.min(50, Number(limit || 20)))}`)
+  if (!result.ok && isMissingRelation(result)) return []
+  if (!result.ok || !Array.isArray(result.data)) return []
+  return result.data
+}
+
+async function listOpenHotHandoffs(limit = 200) {
+  const result = await supabaseRequest(`/hot_handoffs?status=eq.open&select=id,phone,conversation_id,lead_id,lead_name,score,reason,source,status,created_at,updated_at&order=created_at.desc&limit=${Math.max(1, Math.min(500, Number(limit || 200)))}`)
+  if (!result.ok && isMissingRelation(result)) return []
+  if (!result.ok || !Array.isArray(result.data)) return []
+  return result.data
+}
+
+async function upsertHotHandoff(payload = {}) {
+  const phone = normalizePhone(payload.phone)
+  if (!phone) return null
+  const result = await supabaseRequest('/hot_handoffs?on_conflict=phone,status', {
+    method: 'POST',
+    headers: { Prefer: 'resolution=merge-duplicates,return=representation' },
+    body: JSON.stringify({
+      phone,
+      conversation_id: payload.conversation_id || null,
+      lead_id: payload.lead_id || null,
+      lead_name: payload.lead_name || null,
+      score: Number(payload.score || HOT_LEAD_SCORE),
+      reason: payload.reason || 'Lead quente para atendimento humano.',
+      source: payload.source || 'agent',
+      status: 'open',
+      resolved_at: null,
+    }),
+  })
+  if (!result.ok && isMissingRelation(result)) return null
+  return result.ok ? (Array.isArray(result.data) ? result.data[0] : result.data) : null
+}
+
+async function resolveHotHandoff(phone) {
+  const normalized = normalizePhone(phone)
+  if (!normalized) return null
+  const result = await supabaseRequest(`/hot_handoffs?phone=eq.${encodeURIComponent(normalized)}&status=eq.open`, {
+    method: 'PATCH',
+    body: JSON.stringify({
+      status: 'resolved',
+      resolved_at: new Date().toISOString(),
+    }),
+  })
+  if (!result.ok && isMissingRelation(result)) return null
+  return result.ok ? result.data : null
+}
+
+async function saveAutomationLead(item, { niche, city, targetStatus, agentId, cycleId, searchTerm }) {
+  const phone = normalizePhone(item.phone)
+  if (!phone) return { action: 'skipped', lead: null }
+
+  const existing = await supabaseRequest(`/leads?normalized_phone=eq.${encodeURIComponent(phone)}&select=*&limit=1`)
+  const current = existing.ok && Array.isArray(existing.data) ? existing.data[0] : null
+  const rawPatch = {
+    ...(current?.raw_payload || {}),
+    automation: {
+      agent_id: agentId,
+      cycle_id: cycleId,
+      search_term: searchTerm,
+      score: item.score,
+      reasons: item.score_reasons || [],
+      message: item.message || null,
+      imported_at: new Date().toISOString(),
+    },
+    prospect_score: item.score,
+    prospect_gate: item.score >= targetStatus.auto_approve_score
+      ? { status: 'recommended', reason: 'Aprovado automaticamente pelo agente.' }
+      : { status: 'review', reason: 'Importado automaticamente para triagem.' },
+    sources: normalizeLeadSourceList(item),
+    source_count: normalizeLeadSourceList(item).length,
+  }
+
+  if (current) {
+    if (['sent', 'responded', 'qualified', 'opt_out', 'invalid'].includes(current.status)) {
+      return { action: 'kept-existing', lead: current }
+    }
+    const nextStatus = targetStatus.status === 'qualified' ? 'qualified' : (current.status || 'new')
+    const patch = await supabaseRequest(`/leads?id=eq.${encodeURIComponent(current.id)}`, {
+      method: 'PATCH',
+      body: JSON.stringify({
+        status: nextStatus,
+        last_interaction_at: nextStatus === 'qualified' ? new Date().toISOString() : current.last_interaction_at || null,
+        raw_payload: rawPatch,
+      }),
+    })
+    return { action: patch.ok ? 'updated' : 'failed', lead: patch.data?.[0] || current }
+  }
+
+  const insert = await insertLeadRecord({
+    id: randomUUID(),
+    name: item.name || 'Lead sem nome',
+    phone,
+    normalized_phone: phone,
+    niche: item.niche || niche,
+    city: item.city || city,
+    address: item.address || null,
+    website: item.website || null,
+    cnpj: item.cnpj || null,
+    email: item.email || null,
+    source: item.source || 'import',
+    status: targetStatus.status,
+    last_interaction_at: targetStatus.status === 'qualified' ? new Date().toISOString() : null,
+    raw_payload: rawPatch,
+  })
+  return { action: insert.ok ? 'inserted' : 'failed', lead: insert.data?.[0] || null }
+}
+
+async function createAutomationCampaign(agent, leads = []) {
+  if (!leads.length) return null
+  const config = agent.config || {}
+  const instance = config.instance_id
+    ? await findWhatsappInstanceById(config.instance_id)
+    : await findDefaultOpenInstance()
+  if (!instance?.evolution_instance_name) {
+    appendLeadAgentLog(agent, 'Nenhuma instancia aberta para disparo automatico.')
+    return null
+  }
+
+  const payload = {
+    id: randomUUID(),
+    name: `Agente SDR - ${config.niche} - ${config.city} - ${new Date().toLocaleDateString('pt-BR')}`,
+    niche: config.niche,
+    city: config.city,
+    template_id: null,
+    status: 'running',
+    quantity_requested: leads.length,
+    daily_limit: Math.min(leads.length, Number(config.daily_send_limit || leads.length || 1)),
+    delay_min_s: Number(config.delay_min_s || 45),
+    delay_max_s: Number(config.delay_max_s || 90),
+    use_audio: false,
+    started_at: new Date().toISOString(),
+  }
+
+  let result = await supabaseRequest('/campaigns', { method: 'POST', body: JSON.stringify(payload) })
+  if (!result.ok && isMissingColumn(result)) {
+    const minimal = { ...payload }
+    delete minimal.use_audio
+    delete minimal.neighborhood
+    result = await supabaseRequest('/campaigns', { method: 'POST', body: JSON.stringify(minimal) })
+  }
+  if (!result.ok && isMissingColumn(result)) {
+    result = await supabaseRequest('/campaigns', { method: 'POST', body: JSON.stringify(campaignPatchPayload(payload, true)) })
+  }
+  if (!result.ok) {
+    appendLeadAgentLog(agent, `Erro ao criar campanha automatica: ${result.data?.message || 'falha desconhecida'}`)
+    return null
+  }
+  return { campaign: Array.isArray(result.data) ? result.data[0] : result.data, instance }
+}
+
+async function sendAutomationLeadBatch(agent, items = []) {
+  if (!items.length) return { sent: 0, failed: 0, campaign_id: null }
+  const ctx = await createAutomationCampaign(agent, items)
+  if (!ctx?.campaign || !ctx?.instance) return { sent: 0, failed: items.length, campaign_id: null }
+
+  let sent = 0
+  let failed = 0
+  for (const item of items.slice(0, Math.min(items.length, Number(agent.config.daily_send_limit || items.length)))) {
+    const leadRecord = item.lead
+    if (!leadRecord?.id || !item.message) { failed += 1; continue }
+    const outboundText = await finalizeCommercialMessage(item.message, {
+      stage: 'initial',
+      lead: leadRecord,
+      niche: leadRecord.niche || agent.config?.niche,
+      city: leadRecord.city || agent.config?.city,
+    })
+
+    const clRes = await createCampaignLead({
+      campaign_id: ctx.campaign.id,
+      lead_id: leadRecord.id,
+      status: 'pending',
+      scheduled_at: new Date().toISOString(),
+    })
+    const clId = clRes?.data?.[0]?.id
+
+    const pending = await insertMessage({
+      lead_id: leadRecord.id,
+      whatsapp_instance_id: ctx.instance.id,
+      campaign_id: ctx.campaign.id,
+      direction: 'outbound',
+      kind: 'text',
+      phone: normalizePhone(leadRecord.normalized_phone || leadRecord.phone),
+      body: outboundText,
+      status: 'pending',
+      raw_payload: { source: 'automation-agent', automation_agent_id: agent.id, cycle_id: item.cycle_id },
+    })
+
+    let result
+    try {
+      result = await sendWhatsAppText(ctx.instance.evolution_instance_name, normalizePhone(leadRecord.normalized_phone || leadRecord.phone), outboundText)
+    } catch (error) {
+      result = { ok: false, data: { message: error.message } }
+    }
+
+    const ok = Boolean(result?.ok)
+    sent += ok ? 1 : 0
+    failed += ok ? 0 : 1
+
+    if (pending?.id) {
+      await supabaseRequest(`/messages?id=eq.${encodeURIComponent(pending.id)}`, {
+        method: 'PATCH',
+        body: JSON.stringify(ok
+          ? { status: 'sent', provider_message_id: result.data?.key?.id || null, sent_at: new Date().toISOString() }
+          : { status: 'failed', error_message: result.data?.message || 'Falha no envio' }),
+      })
+    }
+    await updateCampaignLead(clId, {
+      status: ok ? 'sent' : 'failed',
+      message_id: pending?.id || null,
+      sent_at: new Date().toISOString(),
+      error: ok ? null : result.data?.message || 'Falha no envio',
+    })
+    await supabaseRequest(`/leads?id=eq.${encodeURIComponent(leadRecord.id)}`, {
+      method: 'PATCH',
+      body: JSON.stringify({ status: ok ? 'sent' : 'qualified', last_interaction_at: new Date().toISOString() }),
+    })
+    await patchCampaign(ctx.campaign.id, { sent_count: sent, failed_count: failed })
+    if (ok) await incrementInstanceSentToday(ctx.instance.id, ctx.instance.sent_today + sent - 1)
+
+    const delay = (Number(agent.config.delay_min_s || 45) + Math.random() * (Number(agent.config.delay_max_s || 90) - Number(agent.config.delay_min_s || 45))) * 1000
+    await new Promise(resolve => setTimeout(resolve, delay))
+  }
+
+  await patchCampaign(ctx.campaign.id, {
+    status: 'finished',
+    finished_at: new Date().toISOString(),
+    sent_count: sent,
+    failed_count: failed,
+  })
+  return { sent, failed, campaign_id: ctx.campaign.id }
+}
+
+function normalizeSequenceStep(row = {}) {
+  return {
+    id: row.id,
+    step_order: Number(row.step_order || 0),
+    label: row.label || `D+${Math.floor(Number(row.delay_hours || 48) / 24)}`,
+    condition: row.condition || 'Sem resposta',
+    delay_hours: Number(row.delay_hours || 48),
+    template_id: row.template_id || null,
+    is_active: row.is_active !== false,
+  }
+}
+
+async function getMessageSequenceById(sequenceId) {
+  if (!sequenceId) return null
+  const seqRes = await supabaseRequest(`/message_sequences?id=eq.${encodeURIComponent(sequenceId)}&select=id,name,niche,is_active,created_at,updated_at&limit=1`)
+  if (!seqRes.ok && isMissingRelation(seqRes)) return null
+  if (!seqRes.ok || !Array.isArray(seqRes.data) || !seqRes.data[0]) return null
+  const sequence = seqRes.data[0]
+  const stepsRes = await supabaseRequest(`/message_sequence_steps?sequence_id=eq.${encodeURIComponent(sequence.id)}&select=id,sequence_id,step_order,label,condition,delay_hours,template_id,is_active&order=step_order.asc`) 
+  const steps = stepsRes.ok && Array.isArray(stepsRes.data) ? stepsRes.data.map(normalizeSequenceStep) : []
+  return {
+    id: sequence.id,
+    name: sequence.name,
+    niche: sequence.niche || 'Geral',
+    is_active: sequence.is_active !== false,
+    created_at: sequence.created_at,
+    updated_at: sequence.updated_at,
+    steps,
+  }
+}
+
+async function listMessageSequences() {
+  const seqRes = await supabaseRequest('/message_sequences?select=id,name,niche,is_active,created_at,updated_at&order=created_at.desc&limit=200')
+  if (!seqRes.ok && isMissingRelation(seqRes)) return { ok: true, status: 200, data: [] }
+  if (!seqRes.ok) return seqRes
+  const sequences = []
+  for (const row of seqRes.data || []) {
+    const loaded = await getMessageSequenceById(row.id)
+    if (loaded) sequences.push(loaded)
+  }
+  return { ok: true, status: 200, data: sequences }
+}
+
+async function createMessageSequence(payload = {}) {
+  const name = String(payload.name || '').trim()
+  const niche = String(payload.niche || 'Geral').trim()
+  if (!name) return { ok: false, status: 400, data: { message: 'name obrigatorio.' } }
+
+  const seqRes = await supabaseRequest('/message_sequences', {
+    method: 'POST',
+    body: JSON.stringify({ name, niche, is_active: true }),
+  })
+  if (!seqRes.ok && isMissingRelation(seqRes)) {
+    return { ok: false, status: 400, data: { message: 'Tabela de sequencias nao existe. Rode a migration 20260501_add_message_sequences.sql.' } }
+  }
+  if (!seqRes.ok) return seqRes
+  const sequence = Array.isArray(seqRes.data) ? seqRes.data[0] : seqRes.data
+
+  const defaultSteps = [
+    { step_order: 0, label: 'D+2', condition: 'Sem resposta', delay_hours: 48 },
+    { step_order: 1, label: 'D+5', condition: 'Sem resposta', delay_hours: 120 },
+    { step_order: 2, label: 'D+10', condition: 'Sem resposta', delay_hours: 240 },
+  ]
+  const stepsPayload = defaultSteps.map(step => ({
+    sequence_id: sequence.id,
+    ...step,
+    template_id: null,
+    is_active: true,
+  }))
+  await supabaseRequest('/message_sequence_steps', {
+    method: 'POST',
+    body: JSON.stringify(stepsPayload),
+  })
+
+  const full = await getMessageSequenceById(sequence.id)
+  return { ok: true, status: 201, data: full }
+}
+
+async function updateMessageSequenceStep(sequenceId, stepIndex, patch = {}) {
+  const stepOrder = Number(stepIndex)
+  if (Number.isNaN(stepOrder) || stepOrder < 0) {
+    return { ok: false, status: 400, data: { message: 'step_index invalido.' } }
+  }
+  const existing = await supabaseRequest(`/message_sequence_steps?sequence_id=eq.${encodeURIComponent(sequenceId)}&step_order=eq.${stepOrder}&select=id&limit=1`)
+  if (!existing.ok && isMissingRelation(existing)) {
+    return { ok: false, status: 400, data: { message: 'Tabela de sequencias nao existe. Rode a migration 20260501_add_message_sequences.sql.' } }
+  }
+  const body = {
+    template_id: patch.template_id || null,
+    label: patch.label || undefined,
+    condition: patch.condition || undefined,
+    delay_hours: patch.delay_hours !== undefined ? Number(patch.delay_hours) : undefined,
+    is_active: patch.is_active !== undefined ? Boolean(patch.is_active) : undefined,
+  }
+  const cleanPatch = Object.fromEntries(Object.entries(body).filter(([, value]) => value !== undefined))
+
+  if (existing.ok && Array.isArray(existing.data) && existing.data[0]?.id) {
+    await supabaseRequest(`/message_sequence_steps?id=eq.${encodeURIComponent(existing.data[0].id)}`, {
+      method: 'PATCH',
+      body: JSON.stringify(cleanPatch),
+    })
+  } else {
+    await supabaseRequest('/message_sequence_steps', {
+      method: 'POST',
+      body: JSON.stringify({
+        sequence_id: sequenceId,
+        step_order: stepOrder,
+        label: patch.label || `D+${Math.ceil((Number(patch.delay_hours || 48)) / 24)}`,
+        condition: patch.condition || 'Sem resposta',
+        delay_hours: Number(patch.delay_hours || 48),
+        template_id: patch.template_id || null,
+        is_active: patch.is_active !== false,
+      }),
+    })
+  }
+  const full = await getMessageSequenceById(sequenceId)
+  return { ok: true, status: 200, data: full }
+}
+
+async function getAutomationSequence(config = {}) {
+  if (config.sequence_id) {
+    const explicit = await getMessageSequenceById(config.sequence_id)
+    if (explicit?.steps?.length) return explicit
+  }
+  const niche = String(config.niche || '').trim()
+  let seqRes = niche
+    ? await supabaseRequest(`/message_sequences?niche=ilike.*${encodeURIComponent(niche)}*&is_active=eq.true&select=id&order=updated_at.desc&limit=1`)
+    : { ok: false }
+  if (!seqRes.ok && isMissingRelation(seqRes)) return null
+  if (!seqRes.ok || !Array.isArray(seqRes.data) || !seqRes.data[0]) {
+    seqRes = await supabaseRequest('/message_sequences?is_active=eq.true&select=id&order=updated_at.desc&limit=1')
+  }
+  if (!seqRes.ok || !Array.isArray(seqRes.data) || !seqRes.data[0]) return null
+  return getMessageSequenceById(seqRes.data[0].id)
+}
+
+async function resolveTemplateText(templateId) {
+  if (!templateId) return null
+  const result = await supabaseRequest(`/message_templates?id=eq.${encodeURIComponent(templateId)}&select=body&is_active=eq.true&limit=1`)
+  if (!result.ok || !Array.isArray(result.data) || !result.data[0]) return null
+  return result.data[0].body || null
+}
+
+async function runLeadFollowUpPass(agent) {
+  const config = agent.config || {}
+  if (!config.enable_follow_up) return { followed_up: 0, failed: 0 }
+
+  const instance = config.instance_id
+    ? await findWhatsappInstanceById(config.instance_id)
+    : await findDefaultOpenInstance()
+  if (!instance?.evolution_instance_name) return { followed_up: 0, failed: 0 }
+
+  const sequence = await getAutomationSequence(config)
+  if (!sequence?.steps?.length) return { followed_up: 0, failed: 0 }
+  const leadsRes = await supabaseRequest(`/leads?niche=ilike.*${encodeURIComponent(config.niche || '')}*&city=ilike.*${encodeURIComponent(config.city || '')}*&status=eq.sent&select=id,name,phone,normalized_phone,niche,city,last_interaction_at,raw_payload&limit=50`)
+  if (!leadsRes.ok || !Array.isArray(leadsRes.data)) return { followed_up: 0, failed: 0 }
+
+  let followedUp = 0
+  let failed = 0
+  for (const lead of leadsRes.data) {
+    const lastAt = lead.last_interaction_at ? new Date(lead.last_interaction_at).getTime() : 0
+    const followMeta = lead.raw_payload?.automation || {}
+    const followUpCount = Number(followMeta.follow_up_count || 0)
+    const step = sequence.steps[followUpCount]
+    if (!step || !step.is_active) continue
+
+    const thresholdMs = Math.max(1, Number(step.delay_hours || config.follow_up_after_hours || 48)) * 60 * 60 * 1000
+    if (!lastAt || Date.now() - lastAt < thresholdMs) continue
+
+    const template = await resolveTemplateText(step.template_id)
+    if (!template) continue
+
+    const textDraft = interpolateTemplate(template, {
+      name: lead.name,
+      niche: lead.niche,
+      city: lead.city,
+    }, lead.niche, lead.city)
+    const text = await finalizeCommercialMessage(textDraft, {
+      stage: 'follow_up',
+      lead,
+      niche: lead.niche,
+      city: lead.city,
+    })
+
+    const pending = await insertMessage({
+      lead_id: lead.id,
+      whatsapp_instance_id: instance.id,
+      direction: 'outbound',
+      kind: 'text',
+      phone: normalizePhone(lead.normalized_phone || lead.phone),
+      body: text,
+      status: 'pending',
+      raw_payload: { source: 'automation-followup', automation_agent_id: agent.id },
+    })
+    const result = await sendWhatsAppText(instance.evolution_instance_name, normalizePhone(lead.normalized_phone || lead.phone), text)
+    const ok = Boolean(result?.ok)
+    if (pending?.id) {
+      await supabaseRequest(`/messages?id=eq.${encodeURIComponent(pending.id)}`, {
+        method: 'PATCH',
+        body: JSON.stringify(ok
+          ? { status: 'sent', sent_at: new Date().toISOString(), provider_message_id: result.data?.key?.id || null }
+          : { status: 'failed', error_message: result.data?.message || 'Falha no follow-up' }),
+      })
+    }
+    if (ok) {
+      followedUp += 1
+      await patchLeadByPhone(lead.normalized_phone || lead.phone, {
+        last_interaction_at: new Date().toISOString(),
+        raw_payload: {
+          ...(lead.raw_payload || {}),
+          automation: {
+            ...(followMeta || {}),
+            sequence_id: sequence.id,
+            follow_up_count: followUpCount + 1,
+            follow_up_step_order: step.step_order,
+            follow_up_sent_at: new Date().toISOString(),
+          },
+        },
+      })
+      await incrementInstanceSentToday(instance.id, instance.sent_today + followedUp - 1)
+    } else {
+      failed += 1
+    }
+  }
+  return { followed_up: followedUp, failed }
+}
+
+async function runLeadAutomationCycle(agent, { manual = false } = {}) {
+  if (agent.running) return serializeLeadAutomationState(agent)
+
+  const config = { ...LEAD_AGENT_DEFAULTS, ...(agent.config || {}) }
+  const cycleId = randomUUID()
+  agent.running = true
+  agent.active = true
+  agent.error = null
+  agent.status = 'running'
+  agent.stage = manual ? 'Executando ciclo manual...' : 'Buscando novas oportunidades...'
+  agent.last_run_at = new Date().toISOString()
+  const cycleStartedAt = agent.last_run_at
+
+  try {
+    const terms = await suggestLeadSearchTerms(config.niche, config.city, config.max_terms)
+    agent.last_terms = terms
+    appendLeadAgentLog(agent, `Plano de busca: ${terms.join(', ')}`)
+
+    const mergedMap = new Map()
+    for (const term of terms) {
+      const found = await discoverAutopilotLeads(term, config.city, config.limit_per_term)
+      for (const lead of found) {
+        const normalized = {
+          ...lead,
+          niche: lead.niche || config.niche,
+          city: lead.city || config.city,
+          search_term: term,
+        }
+        const key = discoveryKey(normalized)
+        mergedMap.set(key, mergeLeadRecords(mergedMap.get(key), normalized))
+      }
+    }
+
+    const merged = [...mergedMap.values()].filter(lead => normalizePhone(lead.phone))
+    const phones = merged.map(lead => normalizePhone(lead.phone)).filter(Boolean)
+    const flags = await getLeadContactFlags(phones)
+
+    let imported = 0
+    let autoApproved = 0
+    let skippedExisting = 0
+    let blocked = 0
+    let belowScore = 0
+    let dispatched = 0
+    let dispatchFailed = 0
+    let followedUp = 0
+    const importedPreview = []
+    const queueToSend = []
+
+    for (const lead of merged.sort((a, b) => discoveryQuality(b) - discoveryQuality(a))) {
+      if (imported >= config.max_new_leads_per_cycle) break
+
+      const phone = normalizePhone(lead.phone)
+      const flag = flags.get(phone) || {}
+      if (flag.blocked || flag.already_contacted) {
+        if (flag.blocked) blocked += 1
+        else skippedExisting += 1
+        continue
+      }
+
+      const local = localLeadScore(lead, false, 'unknown')
+      let ai = { score_delta: 0, reason: 'Pontuacao local aplicada sem IA.', intent: 'medio', message: baseAutopilotMessage(lead, config.niche, config.city) }
+      if (config.ai_personalize) {
+        const siteContent = lead.website ? await analyzeWebsite(lead.website) : null
+        ai = await enrichLeadWithAi(lead, siteContent, config.niche, config.city)
+      }
+      const score = Math.max(0, Math.min(100, local.score + Number(ai.score_delta || 0)))
+      if (score < config.min_score) {
+        belowScore += 1
+        continue
+      }
+
+      const targetStatus = {
+        status: score >= config.auto_approve_score ? 'qualified' : 'new',
+        auto_approve_score: config.auto_approve_score,
+      }
+      const saved = await saveAutomationLead({
+        ...lead,
+        phone,
+        score,
+        score_reasons: [...local.reasons, ai.reason].filter(Boolean),
+        message: ai.message || baseAutopilotMessage(lead, config.niche, config.city),
+      }, {
+        niche: config.niche,
+        city: config.city,
+        targetStatus,
+        agentId: agent.id,
+        cycleId,
+        searchTerm: lead.search_term || config.niche,
+      })
+
+      if (saved.action === 'kept-existing') {
+        skippedExisting += 1
+        continue
+      }
+      if (saved.action === 'failed') continue
+
+      imported += 1
+      if (targetStatus.status === 'qualified') autoApproved += 1
+      importedPreview.push({
+        name: lead.name,
+        city: lead.city || config.city,
+        phone,
+        score,
+        status: targetStatus.status,
+        term: lead.search_term || config.niche,
+      })
+      if (targetStatus.status === 'qualified' && config.auto_send && saved.lead) {
+        queueToSend.push({ lead: saved.lead, message: ai.message || baseAutopilotMessage(lead, config.niche, config.city), cycle_id: cycleId })
+      }
+    }
+
+    if (queueToSend.length) {
+      const sendResult = await sendAutomationLeadBatch(agent, queueToSend)
+      dispatched = sendResult.sent
+      dispatchFailed = sendResult.failed
+      appendLeadAgentLog(agent, `Disparo automatico: ${sendResult.sent} enviados, ${sendResult.failed} falhas.`)
+    }
+
+    const followUpResult = await runLeadFollowUpPass(agent)
+    followedUp = followUpResult.followed_up
+    if (followedUp || followUpResult.failed) {
+      appendLeadAgentLog(agent, `Follow-up automatico: ${followedUp} enviados, ${followUpResult.failed} falhas.`)
+    }
+
+    agent.stats.cycles += 1
+    agent.stats.discovered += merged.length
+    agent.stats.imported += imported
+    agent.stats.auto_approved += autoApproved
+    agent.stats.skipped_existing += skippedExisting
+    agent.stats.blocked += blocked
+    agent.last_cycle = {
+      id: cycleId,
+      started_at: cycleStartedAt,
+      discovered: merged.length,
+      imported,
+      auto_approved: autoApproved,
+      skipped_existing: skippedExisting,
+      blocked,
+      below_score: belowScore,
+      dispatched,
+      dispatch_failed: dispatchFailed,
+      followed_up: followedUp,
+      terms,
+      imported_preview: importedPreview.slice(0, 10),
+      finished_at: new Date().toISOString(),
+      meta: {
+        discarded: {
+          blocked,
+          skipped_existing: skippedExisting,
+          below_score: belowScore,
+        },
+      },
+    }
+    agent.recent_cycles = [agent.last_cycle, ...(Array.isArray(agent.recent_cycles) ? agent.recent_cycles : [])].slice(0, 20)
+    await persistAutomationCycleRun(agent, agent.last_cycle)
+    agent.status = 'active'
+    agent.stage = imported
+      ? `${imported} leads importados (${autoApproved} autoaprovados, ${dispatched} enviados, ${followedUp} follow-ups).`
+      : `Ciclo concluido sem novos leads aproveitaveis${followedUp ? `, com ${followedUp} follow-ups` : ''}.`
+    appendLeadAgentLog(agent, agent.stage)
+  } catch (error) {
+    agent.status = 'error'
+    agent.error = error.message || 'Erro no agente de captacao.'
+    agent.stage = agent.error
+    appendLeadAgentLog(agent, `Erro: ${agent.error}`)
+  } finally {
+    agent.running = false
+    await persistLeadAutomationAgent(agent)
+  }
+
+  return serializeLeadAutomationState(agent)
+}
+
+function scheduleLeadAutomation(agent, { runImmediately = false } = {}) {
+  if (agent.timer) clearTimeout(agent.timer)
+  if (!agent.active) {
+    agent.next_run_at = null
+    return
+  }
+
+  const delayMs = runImmediately ? 250 : Math.max(1, Number(agent.config.interval_minutes || LEAD_AGENT_DEFAULTS.interval_minutes)) * 60 * 1000
+  agent.next_run_at = new Date(Date.now() + delayMs).toISOString()
+  persistLeadAutomationAgent(agent).catch(() => null)
+  agent.timer = setTimeout(async () => {
+    await runLeadAutomationCycle(agent)
+    if (agent.active) scheduleLeadAutomation(agent)
+  }, delayMs)
+}
+
+function stopLeadAutomation(agent) {
+  if (agent.timer) clearTimeout(agent.timer)
+  agent.timer = null
+  agent.active = false
+  agent.running = false
+  agent.status = 'idle'
+  agent.stage = 'Agente pausado.'
+  agent.next_run_at = null
+  appendLeadAgentLog(agent, 'Agente pausado manualmente.')
+  persistLeadAutomationAgent(agent).catch(() => null)
+  return serializeLeadAutomationState(agent)
+}
 
 function extractTextFromHTML(html) {
   return html
@@ -1293,13 +2240,14 @@ async function analyzeWebsite(url) {
 
 async function generatePersonalizedMessage(lead, siteContent, baseTemplate) {
   if (!GROQ_API_KEY) return null
+  const ctx = buildCommercialContext(lead, lead.niche, lead.city)
   const siteInfo = siteContent ? `\nInformações do site deles: ${siteContent.substring(0, 350)}` : ''
   const prompt = `Você é um especialista em prospecção B2B via WhatsApp no Brasil.
 Gere uma mensagem personalizada e direta para prospectar a empresa abaixo.
 
-Empresa: ${lead.name || 'empresa'}
-Segmento: ${lead.niche || ''}
-Cidade: ${lead.city || ''}${siteInfo}
+Empresa: ${ctx.companyName || 'nao informado'}
+Segmento: ${ctx.nicheRef}
+Cidade: ${ctx.cityRef}${siteInfo}
 
 Mensagem base do vendedor (adapte e personalize):
 "${baseTemplate}"
@@ -1310,6 +2258,9 @@ REGRAS OBRIGATÓRIAS:
 - Tom profissional e próximo, como uma pessoa real
 - Termine com uma pergunta simples de qualificação
 - NÃO invente informações
+- Português impecável, sem erro de concordância
+- Nome da empresa é opcional: só use quando soar natural e houver alta confiança
+- Quando não usar nome, prefira "vocês" ou "a empresa"
 - Responda SOMENTE com o texto da mensagem`
 
   try {
@@ -1325,7 +2276,13 @@ REGRAS OBRIGATÓRIAS:
       signal: AbortSignal.timeout(20_000),
     })
     const data = await r.json()
-    return data.choices?.[0]?.message?.content?.trim() || null
+    return finalizeCommercialMessage(data.choices?.[0]?.message?.content?.trim() || '', {
+      stage: 'initial',
+      lead,
+      niche: lead.niche,
+      city: lead.city,
+      originalMessage: baseTemplate,
+    })
   } catch {
     return null
   }
@@ -1371,8 +2328,255 @@ function parseJsonLoose(text) {
   }
 }
 
+function cleanBusinessName(value) {
+  return String(value || '')
+    .replace(/[\r\n]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .replace(/^['"`]+|['"`]+$/g, '')
+    .trim()
+}
+
+function neutralBusinessReference(lead = {}) {
+  const name = cleanBusinessName(lead.name || lead.lead_name || '')
+  return name ? `a empresa ${name}` : 'a empresa'
+}
+
+function cleanShortText(value, fallback = '') {
+  const clean = String(value || '').replace(/[\r\n]+/g, ' ').replace(/\s+/g, ' ').trim()
+  return clean || fallback
+}
+
+function buildCommercialContext(lead = {}, niche = '', city = '') {
+  const companyName = cleanBusinessName(lead.name || lead.lead_name || '')
+  const nicheRef = cleanShortText(lead.niche || niche, 'negocio local')
+  const cityRef = cleanShortText(lead.city || city, 'cidade nao informada')
+  return {
+    companyName,
+    nicheRef,
+    cityRef,
+    objective: 'Descobrir dor operacional real e qualificar para atendimento humano sem parecer robo.',
+    guardrails: [
+      'Nao inventar fatos',
+      'Nao prometer resultado garantido',
+      'Nao pressionar o lead',
+      'Tom comercial profissional e natural',
+    ],
+  }
+}
+
+function polishCommercialMessage(text, lead = {}, niche = '', city = '') {
+  let out = String(text || '')
+    .replace(/\r/g, '')
+    .replace(/[ \t]+/g, ' ')
+    .replace(/\n{3,}/g, '\n\n')
+    .replace(/^['"`]+|['"`]+$/g, '')
+    .trim()
+
+  if (!out) return baseAutopilotMessage(lead, niche, city)
+  return out.slice(0, 700)
+}
+
+function sentenceSplit(text) {
+  return String(text || '')
+    .split(/(?<=[.!?])\s+/)
+    .map(part => part.trim())
+    .filter(Boolean)
+}
+
+function getCommercialStylePolicy(stage = 'initial') {
+  const map = {
+    initial: { maxSentences: 3, maxChars: 420, askQuestion: true, tone: 'abordagem inicial, leve e profissional' },
+    follow_up: { maxSentences: 3, maxChars: 420, askQuestion: true, tone: 'retomada elegante sem insistencia' },
+    sdr_reply: { maxSentences: 2, maxChars: 320, askQuestion: true, tone: 'descoberta de dor com clareza' },
+    opt_out_ack: { maxSentences: 1, maxChars: 180, askQuestion: false, tone: 'encerramento educado' },
+  }
+  return map[stage] || map.initial
+}
+
+function applyCommercialHardLimits(text, policy) {
+  const normalized = String(text || '').replace(/\s+/g, ' ').trim()
+  const sentences = sentenceSplit(normalized).slice(0, Math.max(1, Number(policy.maxSentences || 2)))
+  let limited = sentences.join(' ').trim()
+  if (limited.length > Number(policy.maxChars || 320)) {
+    limited = limited.slice(0, Number(policy.maxChars || 320)).trim()
+    limited = limited.replace(/[,:;\-–—\s]+$/g, '').trim()
+  }
+  return limited
+}
+
+function countQuestions(text) {
+  return (String(text || '').match(/\?/g) || []).length
+}
+
+async function persistMessageQualityAudit(item = {}) {
+  const payload = {
+    agent_id: item.agent_id || item.agentId || null,
+    stage: String(item.stage || 'unknown'),
+    reviewed: Boolean(item.reviewed),
+    changed: Boolean(item.changed),
+    source: String(item.source || 'local'),
+    company: item.company || null,
+    niche: item.niche || null,
+    city: item.city || null,
+    final_chars: Number(item.final_chars || 0),
+    question_count: Number(item.question_count || 0),
+    meta: item.meta || {},
+  }
+  const result = await supabaseRequest('/message_quality_audits', {
+    method: 'POST',
+    body: JSON.stringify(payload),
+  })
+  if (!result.ok && isMissingRelation(result)) return null
+  return result.ok ? (Array.isArray(result.data) ? result.data[0] : result.data) : null
+}
+
+async function listMessageQualityAudits(limit = 80) {
+  const safeLimit = Math.max(1, Math.min(300, Number(limit || 80)))
+  const result = await supabaseRequest(`/message_quality_audits?select=id,created_at,agent_id,stage,reviewed,changed,source,company,niche,city,final_chars,question_count,meta&order=created_at.desc&limit=${safeLimit}`)
+  if (!result.ok && isMissingRelation(result)) return null
+  if (!result.ok || !Array.isArray(result.data)) return null
+  return result.data
+}
+
+function pushMessageQualityAudit(item = {}) {
+  const row = {
+    id: randomUUID(),
+    created_at: new Date().toISOString(),
+    ...item,
+  }
+  messageQualityAudits.unshift(row)
+  if (messageQualityAudits.length > 600) messageQualityAudits.length = 600
+  persistMessageQualityAudit(row).catch(() => null)
+}
+
+function summarizeMessageQuality(items = []) {
+  const summary = {
+    total: items.length,
+    reviewed: 0,
+    changed: 0,
+    avg_chars: 0,
+    question_rate: 0,
+    by_stage: {},
+  }
+  if (!items.length) return summary
+
+  let charTotal = 0
+  let withQuestion = 0
+  for (const item of items) {
+    const stage = item.stage || 'unknown'
+    summary.by_stage[stage] = (summary.by_stage[stage] || 0) + 1
+    if (item.reviewed) summary.reviewed += 1
+    if (item.changed) summary.changed += 1
+    charTotal += Number(item.final_chars || 0)
+    if (Number(item.question_count || 0) > 0) withQuestion += 1
+  }
+  summary.avg_chars = Math.round(charTotal / items.length)
+  summary.question_rate = Math.round((withQuestion / items.length) * 100)
+  return summary
+}
+
+function getMessageQualityAuditPayload(limit = 80, sourceItems = null) {
+  const safeLimit = Math.max(1, Math.min(300, Number(limit || 80)))
+  const base = Array.isArray(sourceItems) ? sourceItems : messageQualityAudits
+  const items = base.slice(0, safeLimit)
+  return {
+    summary: summarizeMessageQuality(items),
+    items,
+  }
+}
+
+async function finalizeCommercialMessage(text, {
+  stage = 'initial',
+  lead = {},
+  niche = '',
+  city = '',
+  originalMessage = '',
+} = {}) {
+  const policy = getCommercialStylePolicy(stage)
+  const ctx = buildCommercialContext(lead, niche, city)
+  const base = polishCommercialMessage(text, lead, niche, city)
+  const local = applyCommercialHardLimits(base, policy)
+  if (!GROQ_API_KEY || !GROQ_COPY_REVIEW) {
+    pushMessageQualityAudit({
+      stage,
+      reviewed: false,
+      changed: local !== base,
+      source: 'local',
+      company: ctx.companyName || null,
+      niche: ctx.nicheRef,
+      city: ctx.cityRef,
+      final_chars: local.length,
+      question_count: countQuestions(local),
+    })
+    return local
+  }
+
+  const prompt = `Voce e um revisor de copy comercial para WhatsApp B2B.
+Reescreva somente se necessario para melhorar clareza, concordancia e profissionalismo sem perder intencao.
+
+Contexto:
+- Empresa: ${ctx.companyName || 'nao informado'}
+- Nicho: ${ctx.nicheRef}
+- Cidade: ${ctx.cityRef}
+- Etapa: ${stage}
+- Tom esperado: ${policy.tone}
+- Objetivo: ${ctx.objective}
+- Mensagem anterior do fluxo: ${(originalMessage || '').slice(0, 250)}
+
+Regras obrigatorias:
+- Portugues impecavel.
+- Nome da empresa e opcional; so use quando natural.
+- Se nao usar nome, use "voces" ou "a empresa".
+- Nao inventar fatos.
+- Nao falar de preco.
+- Limite de ${policy.maxSentences} frases e ${policy.maxChars} caracteres.
+${policy.askQuestion ? '- Termine com pergunta de qualificacao quando fizer sentido.' : '- Nao faca pergunta.'}
+
+Texto base:
+"${local}"
+
+Responda somente com a mensagem final.`
+
+  try {
+    const revised = await groqChat([{ role: 'user', content: prompt }], { temperature: 0.2, maxTokens: 220 })
+    const polished = polishCommercialMessage(revised || local, lead, niche, city)
+    const finalText = applyCommercialHardLimits(polished, policy)
+    pushMessageQualityAudit({
+      stage,
+      reviewed: true,
+      changed: finalText !== local,
+      source: 'groq-review',
+      company: ctx.companyName || null,
+      niche: ctx.nicheRef,
+      city: ctx.cityRef,
+      final_chars: finalText.length,
+      question_count: countQuestions(finalText),
+    })
+    return finalText
+  } catch {
+    pushMessageQualityAudit({
+      stage,
+      reviewed: false,
+      changed: false,
+      source: 'fallback-error',
+      company: ctx.companyName || null,
+      niche: ctx.nicheRef,
+      city: ctx.cityRef,
+      final_chars: local.length,
+      question_count: countQuestions(local),
+    })
+    return local
+  }
+}
+
 function baseAutopilotMessage(lead, niche, city) {
-  return `Oi, tudo bem? Vi a ${lead.name || 'empresa'} em ${lead.city || city} e queria entender se hoje voces ja usam algum sistema para organizar a rotina de ${lead.niche || niche}. Faz sentido eu te fazer uma pergunta rapida? Se nao quiser receber contato, e so me avisar.`
+  const companyRef = neutralBusinessReference(lead)
+  const cityRef = cleanShortText(lead.city || city, 'sua cidade')
+  const nicheRef = cleanShortText(lead.niche || niche, 'sua operacao')
+  const intro = lead?.name
+    ? `Oi, tudo bem? Vi ${companyRef} em ${cityRef}`
+    : `Oi, tudo bem? Vi o negocio de voces em ${cityRef}`
+  return `${intro} e queria entender como voces organizam hoje a rotina de ${nicheRef}. Se fizer sentido, posso te fazer uma pergunta rapida. Se nao quiser receber contato, e so me avisar.`
 }
 
 function localLeadScore(lead = {}, alreadyContacted = false, whatsappStatus = 'unknown') {
@@ -1396,6 +2600,7 @@ function localLeadScore(lead = {}, alreadyContacted = false, whatsappStatus = 'u
 }
 
 async function enrichLeadWithAi(lead, siteContent, niche, city) {
+  const ctx = buildCommercialContext(lead, niche, city)
   const fallback = {
     score_delta: 0,
     intent: 'medio',
@@ -1408,11 +2613,14 @@ async function enrichLeadWithAi(lead, siteContent, niche, city) {
 Analise o lead e retorne SOMENTE JSON valido.
 
 Lead:
-- Empresa: ${lead.name || ''}
-- Nicho: ${lead.niche || niche}
-- Cidade: ${lead.city || city}
+- Empresa: ${ctx.companyName || ''}
+- Nicho: ${ctx.nicheRef}
+- Cidade: ${ctx.cityRef}
 - Fontes: ${normalizeLeadSourceList(lead).join(', ') || 'nao informado'}
 - Site/texto: ${(siteContent || 'sem site analisavel').slice(0, 1200)}
+
+Objetivo comercial da ferramenta:
+- ${ctx.objective}
 
 JSON obrigatorio:
 {
@@ -1426,7 +2634,10 @@ Regras:
 - Nao invente informacoes.
 - Nao use tom agressivo.
 - Identifique claramente que e uma abordagem comercial leve.
-- Nao mencione automacao de envio.`
+- Nao mencione automacao de envio.
+- Portugues impecavel, sem erro de concordancia, virgula e acentos.
+- Nome da empresa e opcional: use apenas quando natural.
+- Quando nao citar nome, use "voces" ou "a empresa".`
 
   try {
     const content = await groqChat([{ role: 'user', content: prompt }], { temperature: 0.45, maxTokens: 320 })
@@ -1436,7 +2647,7 @@ Regras:
       score_delta: Math.max(-15, Math.min(20, Number(parsed.score_delta || 0))),
       intent: ['alto', 'medio', 'baixo'].includes(parsed.intent) ? parsed.intent : 'medio',
       reason: String(parsed.reason || fallback.reason).slice(0, 180),
-      message: String(parsed.message || fallback.message).trim().slice(0, 700),
+      message: polishCommercialMessage(parsed.message || fallback.message, lead, niche, city),
     }
   } catch {
     return fallback
@@ -1580,21 +2791,29 @@ const NICHE_CONTEXT = {
 }
 
 function buildSdrSystemPrompt(lead, originalMessage = '') {
+  const ctx = buildCommercialContext(lead, lead.niche, lead.city)
   const nicheCtx = NICHE_CONTEXT[lead.niche] || `negócios de ${lead.niche || 'varejo'}`
   const ctxMsg = originalMessage ? `\nMensagem que enviamos antes para esse lead:\n"${originalMessage}"\n` : ''
   return `Você é um assistente de pré-vendas de uma empresa de tecnologia que desenvolve sistemas e automações sob medida para pequenos e médios negócios. Entregamos em até 1 semana.${ctxMsg}
 
 Contexto do lead:
-- Empresa: ${lead.lead_name || 'empresa'}
-- Nicho: ${lead.niche || 'negócio local'} (${nicheCtx})
-- Cidade: ${lead.city || 'cidade não informada'}
+- Empresa: ${ctx.companyName || 'nao informado'}
+- Nicho: ${ctx.nicheRef} (${nicheCtx})
+- Cidade: ${ctx.cityRef}
+
+Contexto operacional da ferramenta:
+- Objetivo: ${ctx.objective}
+- Guardrails: ${ctx.guardrails.join(' | ')}
 
 SEU ÚNICO OBJETIVO: descobrir o maior problema operacional desse negócio hoje. Nada de vender ainda — só entender.
 
 REGRAS:
-- Frases curtas, tom de WhatsApp, informal
+- Frases curtas, tom de WhatsApp, profissional e humano
 - Máximo 2 frases por resposta
 - Uma pergunta por vez
+- Português brasileiro impecável, sem erro de concordância
+- Nome da empresa é opcional: só use quando fizer sentido no contexto
+- Quando não usar nome, prefira "vocês" ou "a empresa"
 - Nunca mencione preço, valor, plano ou prazo
 - Nunca diga que é uma IA ou bot
 
@@ -1633,6 +2852,76 @@ COMO AGIR EM CADA SITUAÇÃO:
 Responda APENAS com o texto da mensagem WhatsApp, sem explicações, sem colchetes, sem metadados.`
 }
 
+async function classifyResponseDetailed(messages = [], lead = {}) {
+  const transcript = (messages || [])
+    .slice(-8)
+    .map(message => `${message.role === 'assistant' ? 'Agente' : 'Lead'}: ${message.content || ''}`)
+    .join('\n')
+
+  const fallbackText = transcript.toLowerCase()
+  const fallback = {
+    response_type: /parar|nao quero|não quero|remova|descadastre|opt.?out/.test(fallbackText)
+      ? 'opt_out'
+      : /numero errado|número errado|engano|nao sou eu|não sou eu/.test(fallbackText)
+        ? 'numero_errado'
+        : /tenho interesse|me chama|quero ver|podemos falar|manda mais|me explica/.test(fallbackText)
+          ? 'curioso_positivo'
+          : /sem interesse|agora nao|agora não|depois vejo/.test(fallbackText)
+            ? 'objecao'
+            : 'indeterminado',
+    summary: 'Classificacao heuristica aplicada.',
+    next_action: 'Revisar manualmente a conversa.',
+    escalation: false,
+    handle_automatic: false,
+  }
+
+  if (fallback.response_type === 'opt_out') {
+    fallback.next_action = 'Marcar opt-out e encerrar a conversa.'
+    fallback.handle_automatic = true
+  }
+  if (fallback.response_type === 'numero_errado') {
+    fallback.next_action = 'Marcar numero invalido e encerrar a conversa.'
+    fallback.handle_automatic = true
+  }
+  if (fallback.response_type === 'curioso_positivo') {
+    fallback.next_action = 'Escalar para humano se a dor estiver clara.'
+    fallback.escalation = true
+  }
+
+  if (!GROQ_API_KEY) return fallback
+
+  const prompt = `Classifique a resposta de um lead de WhatsApp para prospeccao B2B.
+Responda SOMENTE JSON valido com este formato:
+{
+  "response_type": "curioso_positivo|objecao|numero_errado|opt_out|nao_responden|indeterminado",
+  "summary": "resumo curto",
+  "next_action": "proxima acao operacional",
+  "escalation": true,
+  "handle_automatic": false
+}
+
+Lead: ${lead.lead_name || lead.name || 'empresa'} | Nicho: ${lead.niche || 'nao informado'} | Cidade: ${lead.city || 'nao informada'}
+Conversa:
+${transcript}`
+
+  try {
+    const raw = await groqChat([{ role: 'user', content: prompt }], { temperature: 0.1, maxTokens: 220 })
+    const parsed = parseJsonLoose(raw)
+    if (!parsed) return fallback
+    return {
+      response_type: ['curioso_positivo', 'objecao', 'numero_errado', 'opt_out', 'nao_responden', 'indeterminado'].includes(parsed.response_type)
+        ? parsed.response_type
+        : fallback.response_type,
+      summary: String(parsed.summary || fallback.summary).slice(0, 220),
+      next_action: String(parsed.next_action || fallback.next_action).slice(0, 220),
+      escalation: Boolean(parsed.escalation),
+      handle_automatic: Boolean(parsed.handle_automatic),
+    }
+  } catch {
+    return fallback
+  }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Histórico de conversa — Supabase
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1641,6 +2930,12 @@ async function getConversation(phone) {
   const result = await supabaseRequest(
     `/conversations?phone=eq.${encodeURIComponent(phone)}&order=created_at.desc&limit=1`
   )
+  if (result.ok && Array.isArray(result.data) && result.data.length) return result.data[0]
+  return null
+}
+
+async function getConversationById(id) {
+  const result = await supabaseRequest(`/conversations?id=eq.${encodeURIComponent(id)}&limit=1`)
   if (result.ok && Array.isArray(result.data) && result.data.length) return result.data[0]
   return null
 }
@@ -1733,6 +3028,15 @@ async function sendWhatsAppText(instanceName, phone, text) {
   })
 }
 
+async function patchLeadByPhone(phone, payload) {
+  const lead = await findLeadByPhone(phone)
+  if (!lead?.id) return null
+  return supabaseRequest(`/leads?id=eq.${encodeURIComponent(lead.id)}`, {
+    method: 'PATCH',
+    body: JSON.stringify(payload),
+  })
+}
+
 async function runSdrAgent(phone, incomingText) {
   if (!GROQ_API_KEY) return
 
@@ -1763,12 +3067,59 @@ async function runSdrAgent(phone, incomingText) {
   }
 
   const messages = Array.isArray(conv.messages) ? conv.messages : []
+  const ts = new Date().toISOString()
+
+  const classified = await classifyResponseDetailed([
+    ...messages,
+    { role: 'user', content: incomingText, ts },
+  ], conv)
+
+  if (classified.handle_automatic) {
+    const nextLeadStatus = classified.response_type === 'opt_out' ? 'opt_out' : 'invalid'
+    await patchLeadByPhone(phone, { status: nextLeadStatus, last_interaction_at: ts })
+    await saveConversation(conv.id, {
+      messages: [...messages, { role: 'user', content: incomingText, ts }],
+      exchanges: conv.exchanges + 1,
+      score: 0,
+      score_reason: classified.summary,
+      status: classified.response_type === 'opt_out' ? 'opt_out' : 'finished',
+      agent_active: false,
+      last_message_at: ts,
+    })
+    if (classified.response_type === 'numero_errado') {
+      await sendWhatsAppText(instance.evolution_instance_name, phone, 'Perfeito, obrigado pelo aviso. Vou encerrar por aqui.')
+    }
+    return
+  }
+
+  if (classified.escalation) {
+    await patchLeadByPhone(phone, { status: 'responded', last_interaction_at: ts })
+    await saveConversation(conv.id, {
+      messages: [...messages, { role: 'user', content: incomingText, ts }],
+      exchanges: conv.exchanges + 1,
+      score: Math.max(HOT_LEAD_SCORE, Number(conv.score || 0)),
+      score_reason: classified.summary,
+      status: 'hot',
+      agent_active: false,
+      last_message_at: ts,
+    })
+    await upsertHotHandoff({
+      phone,
+      conversation_id: conv.id,
+      lead_id: conv.lead_id || null,
+      lead_name: conv.lead_name || null,
+      score: Math.max(HOT_LEAD_SCORE, Number(conv.score || 0)),
+      reason: classified.summary || 'Classificacao marcou conversa como quente.',
+      source: 'classification',
+    })
+    console.log(`[SDR] ${phone} escalado para humano | ${classified.summary}`)
+    return
+  }
 
   // Monta system prompt com contexto da mensagem enviada
   const systemPrompt = buildSdrSystemPrompt(conv, outboundMsg.body)
 
   // Adiciona mensagem do lead ao histórico
-  const ts = new Date().toISOString()
   messages.push({ role: 'user', content: incomingText, ts })
 
   const groqMessages = [
@@ -1784,6 +3135,18 @@ async function runSdrAgent(phone, incomingText) {
     return
   }
 
+  reply = await finalizeCommercialMessage(reply, {
+    stage: 'sdr_reply',
+    lead: {
+      name: conv.lead_name,
+      niche: conv.niche,
+      city: conv.city,
+    },
+    niche: conv.niche,
+    city: conv.city,
+    originalMessage: outboundMsg.body,
+  })
+
   messages.push({ role: 'assistant', content: reply, ts: new Date().toISOString() })
 
   const scoreResult = await scoreLead({ ...conv, messages })
@@ -1795,9 +3158,22 @@ async function runSdrAgent(phone, incomingText) {
     score:           scoreResult.score,
     score_reason:    scoreResult.reason,
     status:          isHot ? 'hot' : scoreResult.status,
-    agent_active:    scoreResult.status !== 'opt_out' && scoreResult.status !== 'finished',
+    agent_active:    !isHot && scoreResult.status !== 'opt_out' && scoreResult.status !== 'finished',
     last_message_at: ts,
   })
+
+  if (isHot) {
+    await patchLeadByPhone(phone, { status: 'responded', last_interaction_at: ts })
+    await upsertHotHandoff({
+      phone,
+      conversation_id: conv.id,
+      lead_id: conv.lead_id || null,
+      lead_name: conv.lead_name || null,
+      score: Number(scoreResult.score || HOT_LEAD_SCORE),
+      reason: scoreResult.reason || 'Score de conversa acima do limiar de lead quente.',
+      source: 'score',
+    })
+  }
 
   console.log(`[SDR] ${phone} | score:${scoreResult.score} | status:${scoreResult.status} | "${reply.slice(0, 60)}..."`)
 
@@ -1832,7 +3208,46 @@ async function handleApi(req, res, url) {
     })
   }
 
-  if (url.pathname === '/api/campaigns' && req.method === 'GET') {
+  if (url.pathname === '/api/classify-response' && req.method === 'POST') {
+    const body = await readBody(req)
+    const messages = Array.isArray(body.messages) ? body.messages : []
+    const lead = body.lead || {}
+
+    const classification = await classifyResponseDetailed(messages, lead)
+    return sendJson(res, 200, classification)
+  }
+
+  if (url.pathname === '/api/dashboard/stats' && req.method === 'GET') {
+    const safeData = result => (result.ok && Array.isArray(result.data) ? result.data : [])
+    const safeLen = result => safeData(result).length
+
+    const leadsRes = await supabaseRequest('/leads?select=id,status&limit=5000')
+    const outboundRes = await supabaseRequest('/messages?select=id&direction=eq.outbound&status=eq.sent&limit=5000')
+    const inboundRes = await supabaseRequest('/messages?select=id&direction=eq.inbound&limit=5000')
+    const hotConvRes = await supabaseRequest('/conversations?select=id&status=eq.hot&limit=5000')
+    const respondedLeadsRes = await supabaseRequest('/leads?select=id&status=eq.responded&limit=5000')
+
+    const leadsFound = safeLen(leadsRes)
+    const messagesSent = safeLen(outboundRes)
+    const repliesReceived = safeLen(inboundRes)
+    const hotLeads = Math.max(safeLen(hotConvRes), safeLen(respondedLeadsRes))
+
+    return sendJson(res, 200, {
+      leads_found: leadsFound,
+      messages_sent: messagesSent,
+      replies_received: repliesReceived,
+      hot_leads: hotLeads,
+      hints: {
+        leads_found: 'total de leads no CRM',
+        messages_sent: 'mensagens outbound com status sent',
+        replies_received: 'mensagens inbound registradas',
+        hot_leads: 'status hot/responded para priorizar humano',
+      },
+    })
+  }
+
+
+    if (url.pathname === '/api/campaigns' && req.method === 'GET') {
     let result = await supabaseRequest('/campaigns?select=id,name,niche,city,neighborhood,use_audio,template_id,status,quantity_requested,daily_limit,sent_count,failed_count,delay_min_s,delay_max_s,started_at,finished_at,created_at&order=created_at.desc')
     if (!result.ok && isMissingColumn(result)) {
       result = await supabaseRequest('/campaigns?select=id,name,niche,city,template_id,status,quantity_requested,daily_limit,delay_min_seconds,delay_max_seconds,started_at,finished_at,created_at&order=created_at.desc')
@@ -1915,6 +3330,37 @@ async function handleApi(req, res, url) {
     return sendJson(res, result.status, result.data?.[0] || result.data)
   }
 
+  if (url.pathname === '/api/leads/dedup' && req.method === 'POST') {
+    // Busca todos os leads agrupados por normalized_phone, mantém o de status mais valioso e apaga os demais
+    const allRes = await supabaseRequest('/leads?select=id,normalized_phone,status,created_at&order=created_at.asc&limit=5000')
+    if (!allRes.ok) return sendJson(res, allRes.status, { message: 'Erro ao buscar leads.' })
+    const leads = allRes.data || []
+    const STATUS_PRIORITY = { qualified: 4, responded: 3, sent: 2, new: 1, invalid: 0, opt_out: 0 }
+    const byPhone = new Map()
+    for (const lead of leads) {
+      const phone = lead.normalized_phone
+      if (!phone) continue
+      if (!byPhone.has(phone)) { byPhone.set(phone, []); }
+      byPhone.get(phone).push(lead)
+    }
+    const toDelete = []
+    for (const [, group] of byPhone) {
+      if (group.length < 2) continue
+      group.sort((a, b) => (STATUS_PRIORITY[b.status] ?? 0) - (STATUS_PRIORITY[a.status] ?? 0))
+      for (let i = 1; i < group.length; i++) toDelete.push(group[i].id)
+    }
+    if (!toDelete.length) return sendJson(res, 200, { deleted: 0, message: 'Nenhuma duplicata encontrada.' })
+    // Deleta em lotes de 50
+    let deleted = 0
+    for (let i = 0; i < toDelete.length; i += 50) {
+      const batch = toDelete.slice(i, i + 50)
+      const ids = batch.map(id => `"${id}"`).join(',')
+      const del = await supabaseRequest(`/leads?id=in.(${ids})`, { method: 'DELETE' })
+      if (del.ok) deleted += batch.length
+    }
+    return sendJson(res, 200, { deleted, message: `${deleted} duplicata(s) removida(s).` })
+  }
+
   const leadStatusMatch = url.pathname.match(/^\/api\/leads\/([^/]+)\/status$/)
   if (leadStatusMatch && req.method === 'PATCH') {
     const leadId = leadStatusMatch[1]
@@ -1958,19 +3404,69 @@ async function handleApi(req, res, url) {
     return sendJson(res, result.status, result.data?.[0] || result.data)
   }
 
+  if (url.pathname === '/api/sequences' && req.method === 'GET') {
+    const result = await listMessageSequences()
+    return sendJson(res, result.status || 200, result.data)
+  }
+
+  if (url.pathname === '/api/sequences' && req.method === 'POST') {
+    const body = await readBody(req)
+    const result = await createMessageSequence(body)
+    return sendJson(res, result.status || 200, result.data)
+  }
+
+  const seqStepMatch = url.pathname.match(/^\/api\/sequences\/([^/]+)\/steps\/([^/]+)$/)
+  if (seqStepMatch && req.method === 'PATCH') {
+    const sequenceId = decodeURIComponent(seqStepMatch[1])
+    const stepIndex = Number(seqStepMatch[2])
+    const body = await readBody(req)
+    const result = await updateMessageSequenceStep(sequenceId, stepIndex, {
+      template_id: body.template_id || null,
+      label: body.label,
+      condition: body.condition,
+      delay_hours: body.delay_hours,
+      is_active: body.is_active,
+    })
+    return sendJson(res, result.status || 200, result.data)
+  }
+
   if (url.pathname === '/api/inbox/conversations' && req.method === 'GET') {
     const result = await supabaseRequest('/messages?select=id,lead_id,direction,phone,body,status,sent_at,received_at,created_at,leads(name,status)&order=created_at.asc&limit=500')
     if (!result.ok) return sendJson(res, result.status, result.data)
 
+    const convResult = await supabaseRequest('/conversations?select=id,phone,score,score_reason,status,agent_active,last_message_at&limit=500')
+    const convMap = new Map(
+      convResult.ok && Array.isArray(convResult.data)
+        ? convResult.data.map(item => [normalizePhone(item.phone), item])
+        : []
+    )
+    const hotRows = await listOpenHotHandoffs(500)
+    const hotMap = new Map(hotRows.map(item => [normalizePhone(item.phone), item]))
+
     const grouped = new Map()
     for (const message of result.data || []) {
       const phone = message.phone || 'sem-telefone'
+      const normalizedPhone = normalizePhone(phone)
+      const convState = convMap.get(normalizedPhone)
       if (!grouped.has(phone)) {
         grouped.set(phone, {
           id: phone,
+          conversation_id: convState?.id || null,
           phone,
           lead: message.leads?.name || phone,
-          mood: message.leads?.status === 'responded' ? 'Quente' : message.direction === 'inbound' ? 'Respondeu' : 'Aguardando',
+          mood: convState?.status === 'hot'
+            ? 'Quente'
+            : message.leads?.status === 'responded'
+              ? 'Respondeu'
+              : message.direction === 'inbound'
+                ? 'Respondeu'
+                : 'Aguardando',
+          status: convState?.status || 'active',
+          score: Number(convState?.score || 0),
+          score_reason: convState?.score_reason || '',
+          agent_active: convState?.agent_active !== false,
+          is_hot_queue: Boolean(hotMap.get(normalizedPhone)),
+          hot_reason: hotMap.get(normalizedPhone)?.reason || '',
           time: '',
           messages: [],
         })
@@ -1987,6 +3483,59 @@ async function handleApi(req, res, url) {
       })
     }
     return sendJson(res, 200, Array.from(grouped.values()).sort((a, b) => String(b.time).localeCompare(String(a.time))))
+  }
+
+  if (url.pathname === '/api/inbox/hot-queue' && req.method === 'GET') {
+    const rows = await listOpenHotHandoffs(200)
+    return sendJson(res, 200, rows)
+  }
+
+  const inboxAgentControlMatch = url.pathname.match(/^\/api\/inbox\/conversations\/([^/]+)\/agent$/)
+  if (inboxAgentControlMatch && req.method === 'PATCH') {
+    const conversationRef = decodeURIComponent(inboxAgentControlMatch[1])
+    const body = await readBody(req)
+    const mode = String(body.mode || '').trim().toLowerCase()
+    if (!['human', 'agent', 'resolved'].includes(mode)) {
+      return sendJson(res, 400, { message: 'mode invalido. Use human, agent ou resolved.' })
+    }
+
+    let conv = conversationRef.includes('-')
+      ? await getConversationById(conversationRef)
+      : await getConversation(normalizePhone(conversationRef))
+    if (!conv) {
+      const phoneRef = normalizePhone(conversationRef)
+      conv = phoneRef ? await getConversation(phoneRef) : null
+    }
+    if (!conv?.id) return sendJson(res, 404, { message: 'Conversa nao encontrada.' })
+
+    const patchByMode = {
+      human: { agent_active: false, status: 'hot' },
+      agent: { agent_active: true, status: 'active' },
+      resolved: { agent_active: false, status: 'finished' },
+    }
+    const patch = {
+      ...patchByMode[mode],
+      last_message_at: new Date().toISOString(),
+    }
+
+    await saveConversation(conv.id, patch)
+
+    if (mode === 'human') {
+      await upsertHotHandoff({
+        phone: conv.phone,
+        conversation_id: conv.id,
+        lead_id: conv.lead_id || null,
+        lead_name: conv.lead_name || null,
+        score: Number(conv.score || HOT_LEAD_SCORE),
+        reason: body.reason || 'Conversa assumida manualmente por humano.',
+        source: 'manual',
+      })
+    } else {
+      await resolveHotHandoff(conv.phone)
+    }
+
+    const updated = await getConversationById(conv.id)
+    return sendJson(res, 200, updated || { id: conv.id, ...patch })
   }
 
   const inboxSendMatch = url.pathname.match(/^\/api\/inbox\/conversations\/([^/]+)\/send$/)
@@ -3146,6 +4695,78 @@ async function handleApi(req, res, url) {
     return sendJson(res, 200, { autopilot_id: jobId, status: 'running' })
   }
 
+  if (url.pathname === '/api/automation/lead-agent/status' && req.method === 'GET') {
+    const agent = getLeadAutomationAgent()
+    agent.recent_cycles = await loadRecentAutomationCycleRuns(agent.id, 20)
+    return sendJson(res, 200, await persistAndSerializeLeadAgent(agent))
+  }
+
+  if (url.pathname === '/api/automation/message-quality' && req.method === 'GET') {
+    const limit = Number(url.searchParams.get('limit') || 80)
+    const dbItems = await listMessageQualityAudits(limit)
+    const payload = getMessageQualityAuditPayload(limit, dbItems)
+    return sendJson(res, 200, {
+      ...payload,
+      storage: Array.isArray(dbItems) ? 'database' : 'memory',
+    })
+  }
+
+  if (url.pathname === '/api/automation/lead-agent/start' && req.method === 'POST') {
+    const body = await readBody(req)
+    const agent = getLeadAutomationAgent()
+    agent.config = normalizeLeadAgentConfig(body, agent.config)
+    if (!agent.config.niche || !agent.config.city) {
+      return sendJson(res, 400, { message: 'niche e city sao obrigatorios para ativar o agente.' })
+    }
+    const intervalMinutes = Math.max(15, Number(agent.config.interval_minutes || LEAD_AGENT_DEFAULTS.interval_minutes))
+    const cyclesPerDay = Math.max(1, Math.floor((24 * 60) / intervalMinutes))
+    const projectedSendPerDay = agent.config.auto_send
+      ? Math.max(0, Number(agent.config.daily_send_limit || 0)) * cyclesPerDay
+      : 0
+    const requiresConfirmation = projectedSendPerDay > LEAD_AGENT_MAX_SENDS_PER_DAY_SOFT
+    if (requiresConfirmation && body.force_high_volume !== true) {
+      return sendJson(res, 409, {
+        message: `Configuracao projeta ${projectedSendPerDay} envios/dia e ultrapassa o limite recomendado (${LEAD_AGENT_MAX_SENDS_PER_DAY_SOFT}/dia). Confirme para continuar.`,
+        requires_confirmation: true,
+        projected_send_per_day: projectedSendPerDay,
+        soft_limit_per_day: LEAD_AGENT_MAX_SENDS_PER_DAY_SOFT,
+      })
+    }
+    agent.active = true
+    agent.status = 'active'
+    agent.stage = 'Agente ativado. Primeiro ciclo em andamento...'
+    agent.started_at = agent.started_at || new Date().toISOString()
+    appendLeadAgentLog(agent, `Agente ativado para ${agent.config.niche} em ${agent.config.city}.`)
+    scheduleLeadAutomation(agent, { runImmediately: true })
+    return sendJson(res, 202, await persistAndSerializeLeadAgent(agent))
+  }
+
+  if (url.pathname === '/api/automation/lead-agent/config' && req.method === 'POST') {
+    const body = await readBody(req)
+    const agent = getLeadAutomationAgent()
+    agent.config = normalizeLeadAgentConfig(body, agent.config)
+    if (!agent.config.niche || !agent.config.city) {
+      return sendJson(res, 400, { message: 'niche e city sao obrigatorios para salvar a configuracao.' })
+    }
+    agent.stage = agent.active ? agent.stage : 'Configuracao salva. Agente aguardando ativacao.'
+    appendLeadAgentLog(agent, `Configuracao salva para ${agent.config.niche} em ${agent.config.city}.`)
+    return sendJson(res, 200, await persistAndSerializeLeadAgent(agent))
+  }
+
+  if (url.pathname === '/api/automation/lead-agent/run' && req.method === 'POST') {
+    const agent = getLeadAutomationAgent()
+    if (!agent.config.niche || !agent.config.city) {
+      return sendJson(res, 400, { message: 'Configure niche e city antes de rodar o agente.' })
+    }
+    const state = await runLeadAutomationCycle(agent, { manual: true })
+    if (agent.active) scheduleLeadAutomation(agent)
+    return sendJson(res, 200, state)
+  }
+
+  if (url.pathname === '/api/automation/lead-agent/stop' && req.method === 'POST') {
+    return sendJson(res, 200, await persistAndSerializeLeadAgent(stopLeadAutomation(getLeadAutomationAgent())))
+  }
+
   if (url.pathname.startsWith('/api/autopilot/') && url.pathname.endsWith('/status') && req.method === 'GET') {
     const jobId = url.pathname.split('/')[3]
     const state = autopilotJobs.get(jobId)
@@ -3171,4 +4792,25 @@ const server = http.createServer(async (req, res) => {
 
 server.listen(PORT, () => {
   console.log(`API proxy rodando em http://127.0.0.1:${PORT}`)
+})
+
+server.on('error', error => {
+  if (error?.code === 'EADDRINUSE') {
+    const pid = detectListeningPid(PORT)
+    if (pid) {
+      if (process.platform === 'win32') {
+        console.error(`[boot] Porta ${PORT} em uso por PID ${pid}. Mate com: taskkill /PID ${pid} /F`)
+      } else {
+        console.error(`[boot] Porta ${PORT} em uso por PID ${pid}. Mate com: kill -9 ${pid}`)
+      }
+    } else {
+      console.error(`[boot] Porta ${PORT} em uso. Finalize o processo atual e rode novamente.`)
+    }
+    return
+  }
+  console.error('[boot] Erro ao iniciar API:', error.message || error)
+})
+
+restoreLeadAutomationAgents().catch(error => {
+  console.error('[automation] restore error:', error.message)
 })

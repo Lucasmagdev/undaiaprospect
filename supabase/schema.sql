@@ -31,6 +31,95 @@ create table if not exists public.message_templates (
   created_at timestamptz not null default now()
 );
 
+create table if not exists public.automation_agents (
+  id text primary key,
+  kind text not null default 'lead-automation',
+  active boolean not null default false,
+  config jsonb not null default '{}'::jsonb,
+  state jsonb not null default '{}'::jsonb,
+  last_run_at timestamptz,
+  next_run_at timestamptz,
+  started_at timestamptz,
+  updated_at timestamptz not null default now()
+);
+
+create table if not exists public.message_sequences (
+  id uuid primary key default gen_random_uuid(),
+  name text not null,
+  niche text,
+  is_active boolean not null default true,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now()
+);
+
+create table if not exists public.message_sequence_steps (
+  id uuid primary key default gen_random_uuid(),
+  sequence_id uuid not null references public.message_sequences(id) on delete cascade,
+  step_order integer not null,
+  label text not null,
+  condition text not null default 'Sem resposta',
+  delay_hours integer not null default 48,
+  template_id text,
+  is_active boolean not null default true,
+  created_at timestamptz not null default now(),
+  unique (sequence_id, step_order)
+);
+
+create table if not exists public.automation_cycle_runs (
+  id uuid primary key default gen_random_uuid(),
+  agent_id text not null,
+  cycle_id uuid,
+  started_at timestamptz,
+  finished_at timestamptz not null default now(),
+  niche text,
+  city text,
+  discovered integer not null default 0,
+  imported integer not null default 0,
+  auto_approved integer not null default 0,
+  skipped_existing integer not null default 0,
+  blocked integer not null default 0,
+  below_score integer not null default 0,
+  dispatched integer not null default 0,
+  dispatch_failed integer not null default 0,
+  followed_up integer not null default 0,
+  terms jsonb not null default '[]'::jsonb,
+  imported_preview jsonb not null default '[]'::jsonb,
+  meta jsonb not null default '{}'::jsonb,
+  created_at timestamptz not null default now()
+);
+
+create table if not exists public.hot_handoffs (
+  id uuid primary key default gen_random_uuid(),
+  phone text not null,
+  conversation_id uuid,
+  lead_id uuid references public.leads(id) on delete set null,
+  lead_name text,
+  score integer not null default 0,
+  reason text,
+  source text not null default 'agent',
+  status text not null default 'open',
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now(),
+  resolved_at timestamptz,
+  unique (phone, status)
+);
+
+create table if not exists public.message_quality_audits (
+  id uuid primary key default gen_random_uuid(),
+  agent_id text,
+  stage text not null,
+  reviewed boolean not null default false,
+  changed boolean not null default false,
+  source text not null default 'local',
+  company text,
+  niche text,
+  city text,
+  final_chars integer not null default 0,
+  question_count integer not null default 0,
+  meta jsonb not null default '{}'::jsonb,
+  created_at timestamptz not null default now()
+);
+
 create table if not exists public.campaigns (
   id uuid primary key default gen_random_uuid(),
   name text not null,
@@ -100,6 +189,13 @@ create table if not exists public.campaign_leads (
 );
 
 create index if not exists whatsapp_instances_status_idx on public.whatsapp_instances (status);
+create index if not exists automation_agents_active_idx on public.automation_agents (active);
+create index if not exists message_sequences_niche_idx on public.message_sequences (niche, is_active);
+create index if not exists message_sequence_steps_seq_idx on public.message_sequence_steps (sequence_id, step_order);
+create index if not exists automation_cycle_runs_agent_idx on public.automation_cycle_runs (agent_id, finished_at desc);
+create index if not exists hot_handoffs_status_idx on public.hot_handoffs (status, created_at desc);
+create index if not exists message_quality_audits_created_idx on public.message_quality_audits (created_at desc);
+create index if not exists message_quality_audits_stage_idx on public.message_quality_audits (stage, created_at desc);
 create index if not exists leads_niche_idx on public.leads (niche);
 create index if not exists leads_city_idx on public.leads (city);
 create index if not exists leads_status_idx on public.leads (status);
@@ -114,6 +210,12 @@ create index if not exists messages_campaign_idx on public.messages (campaign_id
 create index if not exists messages_created_idx on public.messages (created_at desc);
 
 alter table public.whatsapp_instances disable row level security;
+alter table public.automation_agents disable row level security;
+alter table public.message_sequences disable row level security;
+alter table public.message_sequence_steps disable row level security;
+alter table public.automation_cycle_runs disable row level security;
+alter table public.hot_handoffs disable row level security;
+alter table public.message_quality_audits disable row level security;
 alter table public.leads disable row level security;
 alter table public.message_templates disable row level security;
 alter table public.campaigns disable row level security;

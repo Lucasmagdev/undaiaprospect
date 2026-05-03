@@ -36,16 +36,33 @@ const app = document.querySelector('#app')
 
 /* ── ROUTER ── */
 
-async function navigate(tabId) {
+async function navigate(tabId, subRoute = null) {
   activeTab = tabId
   renderShell()
 
   const contentView = document.querySelector('.content-view')
-  const mod = await viewModules[tabId]()
 
+  if (subRoute?.view === 'campaign-detail') {
+    const mod = await import('./views/campaign-detail.js')
+    mod.setCampaignId(subRoute.params.id)
+    contentView.innerHTML = mod.render()
+    await mod.setup?.(contentView)
+    return
+  }
+
+  if (subRoute?.view === 'prospect-config') {
+    const mod = await import('./views/prospect-config.js')
+    contentView.innerHTML = mod.render()
+    await mod.setup?.(contentView)
+    return
+  }
+
+  const mod = await viewModules[tabId]()
   contentView.innerHTML = mod.render()
   await mod.setup?.(contentView)
 }
+
+window.__navigate = navigate
 
 /* ── SHELL ── */
 

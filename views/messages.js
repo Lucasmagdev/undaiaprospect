@@ -16,6 +16,14 @@ function highlightVars(text) {
   return text.replace(/\{([^}]+)\}/g, '<mark class="tpl-var">{$1}</mark>')
 }
 
+function escapeAttr(value) {
+  return String(value ?? '')
+    .replace(/&/g, '&amp;')
+    .replace(/"/g, '&quot;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+}
+
 /* ── RENDER ── */
 
 export function render() {
@@ -161,12 +169,7 @@ function renderSequences(root) {
   _activeSeqId = active
   const seq = _sequences.find(s => s.id === active)
 
-  const allTemplateOptions = [
-    ...(_templates.map(t => ({ id: t.id, label: `[Template] ${t.name}` }))),
-    ...Object.entries(_nicheBank).flatMap(([niche, msgs]) =>
-      msgs.map(m => ({ id: m.id, label: `[${niche}] ${m.label}` }))
-    ),
-  ]
+  const allTemplateOptions = _templates.map(t => ({ id: t.id, label: `[Template] ${t.name}` }))
 
   content.innerHTML = `
     <div class="seq-layout">
@@ -215,19 +218,19 @@ function renderSequences(root) {
 
   content.querySelectorAll('.seq-item').forEach(btn => {
     btn.addEventListener('click', () => {
-      _activeSeqId = Number(btn.dataset.seq)
+      _activeSeqId = btn.dataset.seq
       renderSequences(root)
     })
   })
 
   content.querySelectorAll('.step-select').forEach(sel => {
     sel.addEventListener('change', async () => {
-      const seqId = Number(sel.dataset.seq)
+      const seqId = sel.dataset.seq
       const stepIndex = Number(sel.dataset.step)
-      const val = sel.value === '' ? null : (isNaN(Number(sel.value)) ? sel.value : Number(sel.value))
+      const val = sel.value === '' ? null : sel.value
       try {
         const updated = await TemplateService.updateSequenceStep(seqId, stepIndex, val)
-        _sequences = _sequences.map(s => s.id === seqId ? updated : s)
+        _sequences = _sequences.map(s => String(s.id) === String(seqId) ? updated : s)
         const preview = sel.closest('.seq-step').querySelector('.step-preview')
         const body = TemplateService.resolveBody(val)
         preview.className = `step-preview ${body ? '' : 'empty'}`
@@ -259,10 +262,18 @@ async function renderTemplates(root) {
           <h2>${t.name}</h2>
           <p class="template-body">${highlightVars(t.body)}</p>
           <strong>${t.conversion} de conversão</strong>
+          <button class="secondary edit-template-btn" data-template-id="${t.id}">Editar</button>
         </article>
       `).join('')}
     </div>
   `
+
+  content.querySelectorAll('.edit-template-btn').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const template = _templates.find(t => String(t.id) === String(btn.dataset.templateId))
+      if (template) openTemplateModal(root, template)
+    })
+  })
 }
 
 /* ── MODALS ── */
@@ -317,22 +328,27 @@ const TEMPLATE_SUGESTOES = [
 ]
 
 function openNewTemplateModal(root) {
+  openTemplateModal(root)
+}
+
+function openTemplateModal(root, template = null) {
+  const isEditing = Boolean(template)
   const sugestoesHtml = TEMPLATE_SUGESTOES.map((s, i) =>
     `<button type="button" class="secondary" style="font-size:11px;padding:4px 8px" data-sug="${i}">${s.label}</button>`
   ).join(' ')
 
   openModal({
-    title: 'Novo template',
-    submitLabel: 'Salvar template',
+    title: isEditing ? 'Editar template' : 'Novo template',
+    submitLabel: isEditing ? 'Salvar alteracoes' : 'Salvar template',
     body: `
       <div style="display:grid;gap:12px">
         <label style="display:grid;gap:5px;font-size:.78rem;font-weight:600;color:var(--text-2)">
           Nome
-          <input id="t-name" placeholder="ex: Primeiro contato — {nicho}" />
+          <input id="t-name" placeholder="ex: Primeiro contato — {nicho}" value="${escapeAttr(template?.name)}" />
         </label>
         <label style="display:grid;gap:5px;font-size:.78rem;font-weight:600;color:var(--text-2)">
           Uso
-          <input id="t-use" placeholder="ex: Primeiro contato frio" />
+          <input id="t-use" placeholder="ex: Primeiro contato frio" value="${escapeAttr(template?.use)}" />
         </label>
         <label style="display:grid;gap:5px;font-size:.78rem;font-weight:600;color:var(--text-2)">
           Mensagem
@@ -340,7 +356,7 @@ function openNewTemplateModal(root) {
             Variaveis: <code>{cidade}</code> <code>{nicho}</code> — evite usar o nome da empresa no inicio, soa robotico.
           </p>
           <div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:6px">${sugestoesHtml}</div>
-          <textarea id="t-body" rows="5" style="width:100%;border:1px solid var(--border-strong);border-radius:10px;padding:10px 12px;font:inherit;font-size:.875rem;outline:none;resize:vertical" placeholder="Escreva sua mensagem aqui..."></textarea>
+          <textarea id="t-body" rows="5" style="width:100%;border:1px solid var(--border-strong);border-radius:10px;padding:10px 12px;font:inherit;font-size:.875rem;outline:none;resize:vertical" placeholder="Escreva sua mensagem aqui...">${escapeAttr(template?.body)}</textarea>
         </label>
       </div>
     `,
@@ -357,9 +373,15 @@ function openNewTemplateModal(root) {
       const use  = bodyEl.querySelector('#t-use').value.trim()
       const text = bodyEl.querySelector('#t-body').value.trim()
       if (!name || !use || !text) { toast('Preencha todos os campos.', 'warning'); throw new Error('validation') }
-      const t = await TemplateService.create({ name, use, body: text, conversion: '—' })
-      _templates.push(t)
-      toast(`Template "${name}" salvo.`, 'success')
+      if (isEditing) {
+        const updated = await TemplateService.update(template.id, { name, use, body: text })
+        _templates = _templates.map(t => String(t.id) === String(template.id) ? updated : t)
+        toast(`Template "${name}" atualizado.`, 'success')
+      } else {
+        const t = await TemplateService.create({ name, use, body: text, conversion: '—' })
+        _templates.push(t)
+        toast(`Template "${name}" salvo.`, 'success')
+      }
       renderTemplates(root)
     },
   })

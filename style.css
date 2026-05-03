@@ -523,6 +523,16 @@ input:focus {
   transition: box-shadow var(--t-md), transform var(--t-md);
 }
 
+.metric-action {
+  text-align: left;
+  width: 100%;
+}
+
+.metric-action:focus-visible {
+  outline: 2px solid var(--green-500);
+  outline-offset: 2px;
+}
+
 .metric:hover {
   box-shadow: var(--shadow-md);
   transform: translateY(-2px);
@@ -2087,6 +2097,36 @@ td strong { color: var(--text-1); font-weight: 600; }
 
 .prospect-panel { margin-bottom: 24px; }
 
+.pilot-strip {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 10px;
+  margin: 12px 0 16px;
+}
+
+.pilot-strip div,
+.lead-summary-grid div {
+  border: 1px solid var(--border);
+  background: var(--bg-2);
+  border-radius: 8px;
+  padding: 10px 12px;
+}
+
+.pilot-strip span,
+.lead-summary-grid span {
+  display: block;
+  color: var(--text-3);
+  font-size: 11px;
+  font-weight: 600;
+  margin-bottom: 3px;
+}
+
+.pilot-strip strong,
+.lead-summary-grid strong {
+  color: var(--text-1);
+  font-size: 15px;
+}
+
 .prospect-form {
   display: flex;
   gap: 12px;
@@ -2182,9 +2222,19 @@ td strong { color: var(--text-1); font-weight: 600; }
   font-size: 12px;
 }
 
+.lead-summary-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 10px;
+  padding: 14px;
+  border-bottom: 1px solid var(--border);
+}
+
 .skeleton-wrap { padding: 8px 0; }
 
 @media (max-width: 640px) {
+  .pilot-strip,
+  .lead-summary-grid { grid-template-columns: 1fr 1fr; }
   .prospect-form { flex-direction: column; }
   .discovery-cards { grid-template-columns: 1fr; }
 }

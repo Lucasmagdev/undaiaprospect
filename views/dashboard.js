@@ -1,6 +1,21 @@
 import { metric, animateMetrics, progress, badge } from '../components.js'
 
-export const state = { realtime: { found: 84, sent: 57, replies: 9 }, timer: null, paused: false }
+export const state = {
+  realtime: { found: 0, sent: 0, replies: 0, hot: 0 },
+  timer: null,
+  paused: false,
+}
+
+function dashboardMetric(label, value, hint, action) {
+  const isNum = typeof value === 'number'
+  return `
+    <button class="metric metric-action" type="button" data-dashboard-action="${action}">
+      <span class="metric-label">${label}</span>
+      <strong class="metric-value"${isNum ? ` data-target="${value}"` : ''}>${isNum ? 0 : value}</strong>
+      <small class="metric-hint">${hint}</small>
+    </button>
+  `
+}
 
 export function render() {
   return `
@@ -22,10 +37,10 @@ export function render() {
     </section>
 
     <section class="metrics" id="dash-metrics">
-      ${metric('Leads encontrados', state.realtime.found, '+18 nas últimas 2h')}
-      ${metric('Mensagens enviadas', state.realtime.sent, 'limite diário: 120')}
-      ${metric('Respostas recebidas', state.realtime.replies, '15.8% de resposta')}
-      ${metric('Leads quentes', 6, '2 aguardando proposta')}
+      ${dashboardMetric('Leads encontrados', state.realtime.found, 'carregando...', 'leads')}
+      ${dashboardMetric('Mensagens enviadas', state.realtime.sent, 'carregando...', 'sent')}
+      ${dashboardMetric('Respostas recebidas', state.realtime.replies, 'carregando...', 'replies')}
+      ${dashboardMetric('Leads quentes', state.realtime.hot, 'carregando...', 'hot')}
     </section>
 
     <section class="split">
@@ -62,8 +77,11 @@ export function render() {
 export async function setup(root) {
   animateMetrics(root)
 
-  // Load campaigns
-  const { CampaignService } = await import('../services.js')
+  // Load dashboard metrics and campaigns
+  const { CampaignService, DashboardService } = await import('../services.js')
+  await loadDashboardMetrics(root, DashboardService)
+  bindMetricActions(root)
+
   let campaigns = []
   try {
     campaigns = await CampaignService.list()
@@ -98,16 +116,13 @@ export async function setup(root) {
     state.paused = false
     pause.disabled = false
     pause.textContent = 'Pausar'
-    addLog(activity, 'Campanha simulada no painel. Para envio real, use a tela Campanhas.')
+    addLog(activity, 'Use Campanhas ou Piloto Auto para buscar leads e disparar mensagens reais.')
 
     state.timer = setInterval(() => {
       if (state.paused) return
-      state.realtime.found += 1
-      if (state.realtime.found % 2 === 0) state.realtime.sent += 1
-      if (state.realtime.sent % 9 === 0) state.realtime.replies += 1
-      updateMetrics(root)
-      addLog(activity, `Lead processado. ${state.realtime.sent} mensagens enviadas hoje.`)
-    }, 1600)
+      loadDashboardMetrics(root, DashboardService, false)
+      addLog(activity, 'Dashboard atualizado com os dados reais da operação.')
+    }, 5000)
   })
 
   pause.addEventListener('click', () => {
@@ -117,11 +132,53 @@ export async function setup(root) {
   })
 }
 
-function updateMetrics(root) {
-  const vals = root.querySelectorAll('.metric-value[data-target]')
-  if (vals[0]) { vals[0].textContent = state.realtime.found; vals[0].dataset.target = state.realtime.found }
-  if (vals[1]) { vals[1].textContent = state.realtime.sent;  vals[1].dataset.target = state.realtime.sent }
-  if (vals[2]) { vals[2].textContent = state.realtime.replies; vals[2].dataset.target = state.realtime.replies }
+async function loadDashboardMetrics(root, DashboardService, animate = true) {
+  const metrics = root.querySelector('#dash-metrics')
+  if (!metrics) return
+
+  try {
+    const stats = await DashboardService.stats()
+    state.realtime = {
+      found: Number(stats.leads_found || 0),
+      sent: Number(stats.messages_sent || 0),
+      replies: Number(stats.replies_received || 0),
+      hot: Number(stats.hot_leads || 0),
+    }
+    const hints = stats.hints || {}
+    metrics.innerHTML = `
+      ${dashboardMetric('Leads encontrados', state.realtime.found, hints.leads_found || 'total importado no CRM', 'leads')}
+      ${dashboardMetric('Mensagens enviadas', state.realtime.sent, hints.messages_sent || 'mensagens com status enviado', 'sent')}
+      ${dashboardMetric('Respostas recebidas', state.realtime.replies, hints.replies_received || 'mensagens recebidas no WhatsApp', 'replies')}
+      ${dashboardMetric('Leads quentes', state.realtime.hot, hints.hot_leads || 'respondidos, hot ou fechados', 'hot')}
+    `
+    bindMetricActions(root)
+    if (animate) animateMetrics(metrics)
+    else {
+      metrics.querySelectorAll('.metric-value[data-target]').forEach(el => {
+        el.textContent = el.dataset.target
+      })
+    }
+  } catch (err) {
+    metrics.innerHTML = `
+      ${dashboardMetric('Leads encontrados', 0, 'API indisponível', 'leads')}
+      ${dashboardMetric('Mensagens enviadas', 0, 'API indisponível', 'sent')}
+      ${dashboardMetric('Respostas recebidas', 0, 'API indisponível', 'replies')}
+      ${dashboardMetric('Leads quentes', 0, 'API indisponível', 'hot')}
+    `
+    bindMetricActions(root)
+  }
+}
+
+function bindMetricActions(root) {
+  root.querySelectorAll('[data-dashboard-action]').forEach(card => {
+    card.addEventListener('click', () => {
+      const action = card.dataset.dashboardAction
+      if (action === 'leads') window.__navigate?.('leads')
+      if (action === 'sent') window.__navigate?.('instances')
+      if (action === 'replies') window.__navigate?.('inbox')
+      if (action === 'hot') window.__navigate?.('inbox')
+    })
+  })
 }
 
 function addLog(activity, text) {

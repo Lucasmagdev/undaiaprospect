@@ -132,6 +132,23 @@ let _sequences = [
   },
 ]
 
+function mapSequence(sequence) {
+  const steps = Array.isArray(sequence?.steps) ? sequence.steps : []
+  return {
+    id: sequence.id,
+    name: sequence.name,
+    niche: sequence.niche || 'Geral',
+    steps: steps.map((step, index) => ({
+      day: Math.round(Number(step.delay_hours || 0) / 24),
+      label: step.label || `D+${Math.round(Number(step.delay_hours || 0) / 24)}`,
+      templateId: step.template_id || null,
+      condition: step.condition || 'Sem resposta',
+      stepOrder: Number(step.step_order ?? index),
+      delayHours: Number(step.delay_hours || 0),
+    })),
+  }
+}
+
 /* ── CAMPAIGN SERVICE ── */
 
 function compactDate(value) {
@@ -158,6 +175,17 @@ function templateUse(purpose) {
     other: 'Outro',
   }[purpose] || purpose
 }
+
+function mapTemplate(template) {
+  return {
+    id: template.id,
+    name: template.name,
+    use: templateUse(template.purpose),
+    conversion: '—',
+    body: template.body,
+  }
+}
+
 export const CampaignService = {
   async list() {
     const campaigns = await apiFetch('/api/campaigns')
@@ -205,6 +233,10 @@ export const CampaignService = {
   async status(id) {
     return apiFetch(`/api/campaigns/${id}/status`)
   },
+
+  async get(id) {
+    return apiFetch(`/api/campaigns/${encodeURIComponent(id)}`)
+  },
 }
 /* ── LEAD SERVICE ── */
 
@@ -228,6 +260,9 @@ export const LeadService = {
       email: l.email || '',
       source: l.source || 'manual',
       sources: l.raw_payload?.sources || [],
+      prospect_score: l.raw_payload?.prospect_score ?? l.raw_payload?.quality_score ?? null,
+      prospect_gate: l.raw_payload?.prospect_gate || null,
+      source_count: l.raw_payload?.source_count ?? l.raw_payload?.sources?.length ?? null,
       status: l.status || 'new',
       last: compactDate(l.last_interaction_at || l.created_at),
     }))
@@ -259,6 +294,42 @@ export const LeadService = {
     return [headers, ...rows].map(r => r.map(v => `"${v}"`).join(',')).join('\n')
   },
 }
+
+export const AutomationService = {
+  async leadAgentStatus() {
+    return apiFetch('/api/automation/lead-agent/status')
+  },
+
+  async saveLeadAgentConfig(payload) {
+    return apiFetch('/api/automation/lead-agent/config', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    })
+  },
+
+  async messageQuality(limit = 80) {
+    return apiFetch(`/api/automation/message-quality?limit=${encodeURIComponent(String(limit))}`)
+  },
+
+  async startLeadAgent(payload) {
+    return apiFetch('/api/automation/lead-agent/start', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    })
+  },
+
+  async runLeadAgentNow() {
+    return apiFetch('/api/automation/lead-agent/run', {
+      method: 'POST',
+    })
+  },
+
+  async stopLeadAgent() {
+    return apiFetch('/api/automation/lead-agent/stop', {
+      method: 'POST',
+    })
+  },
+}
 /* ── CONVERSATION SERVICE ── */
 
 export const ConversationService = {
@@ -266,11 +337,30 @@ export const ConversationService = {
     return apiFetch('/api/inbox/conversations')
   },
 
+  async hotQueue() {
+    return apiFetch('/api/inbox/hot-queue')
+  },
+
+  async setAgentMode(conversationId, mode, reason = '') {
+    return apiFetch(`/api/inbox/conversations/${encodeURIComponent(conversationId)}/agent`, {
+      method: 'PATCH',
+      body: JSON.stringify({ mode, reason }),
+    })
+  },
+
   async send(conversationId, text) {
     return apiFetch(`/api/inbox/conversations/${encodeURIComponent(conversationId)}/send`, {
       method: 'POST',
       body: JSON.stringify({ text }),
     })
+  },
+}
+
+/* ── DASHBOARD SERVICE ── */
+
+export const DashboardService = {
+  async stats() {
+    return apiFetch('/api/dashboard/stats')
   },
 }
 /* ── TEMPLATE SERVICE ── */
@@ -292,13 +382,8 @@ function resolveTemplateBody(id) {
 export const TemplateService = {
   async list() {
     const templates = await apiFetch('/api/templates')
-    return templates.map(t => ({
-      id: t.id,
-      name: t.name,
-      use: templateUse(t.purpose),
-      conversion: '—',
-      body: t.body,
-    }))
+    _templates = templates.map(mapTemplate)
+    return _templates.map(t => ({ ...t }))
   },
 
   async create(data) {
@@ -306,13 +391,19 @@ export const TemplateService = {
       method: 'POST',
       body: JSON.stringify(data),
     })
-    return {
-      id: template.id,
-      name: template.name,
-      use: templateUse(template.purpose),
-      conversion: '—',
-      body: template.body,
-    }
+    const mapped = mapTemplate(template)
+    _templates.push(mapped)
+    return { ...mapped }
+  },
+
+  async update(id, data) {
+    const template = await apiFetch(`/api/templates/${encodeURIComponent(id)}`, {
+      method: 'PATCH',
+      body: JSON.stringify(data),
+    })
+    const mapped = mapTemplate(template)
+    _templates = _templates.map(t => String(t.id) === String(id) ? mapped : t)
+    return { ...mapped }
   },
 
   async listNicheBank() {
@@ -321,34 +412,29 @@ export const TemplateService = {
   },
 
   async listSequences() {
-    await delay(200)
+    const sequences = await apiFetch('/api/sequences')
+    _sequences = (Array.isArray(sequences) ? sequences : []).map(mapSequence)
     return _sequences.map(s => ({ ...s, steps: s.steps.map(st => ({ ...st })) }))
   },
 
   async createSequence(data) {
-    await delay(400)
-    const seq = {
-      id: Date.now(),
-      name: data.name,
-      niche: data.niche || 'Geral',
-      steps: [
-        { day: 0,  label: 'D+0',  templateId: null, condition: 'Primeiro envio' },
-        { day: 2,  label: 'D+2',  templateId: null, condition: 'Sem resposta' },
-        { day: 5,  label: 'D+5',  templateId: null, condition: 'Sem resposta' },
-        { day: 10, label: 'D+10', templateId: null, condition: 'Sem resposta' },
-      ],
-    }
-    _sequences.push(seq)
-    return seq
+    const sequence = await apiFetch('/api/sequences', {
+      method: 'POST',
+      body: JSON.stringify(data),
+    })
+    const mapped = mapSequence(sequence)
+    _sequences = [mapped, ..._sequences.filter(seq => String(seq.id) !== String(mapped.id))]
+    return mapped
   },
 
   async updateSequenceStep(seqId, stepIndex, templateId) {
-    await delay(150)
-    const seq = _sequences.find(s => s.id === seqId)
-    if (!seq || !seq.steps[stepIndex]) throw new Error('Sequencia ou etapa nao encontrada')
-    seq.steps[stepIndex].templateId = templateId
-    seq.steps[stepIndex].preview = resolveTemplateBody(templateId)
-    return { ...seq, steps: seq.steps.map(st => ({ ...st })) }
+    const updated = await apiFetch(`/api/sequences/${encodeURIComponent(seqId)}/steps/${encodeURIComponent(stepIndex)}`, {
+      method: 'PATCH',
+      body: JSON.stringify({ template_id: templateId || null }),
+    })
+    const mapped = mapSequence(updated)
+    _sequences = _sequences.map(seq => String(seq.id) === String(seqId) ? mapped : seq)
+    return mapped
   },
 
   resolveBody: resolveTemplateBody,
@@ -377,29 +463,61 @@ export const SettingsService = {
 
 /* ── WHATSAPP INSTANCE SERVICE ── */
 
-const API_BASE = import.meta.env.VITE_API_BASE || 'http://127.0.0.1:3001'
+const DEFAULT_API_BASE = 'http://127.0.0.1:3001'
+const RAW_API_BASE = String(import.meta.env.VITE_API_BASE || '').trim()
+
+function normalizeBase(base) {
+  return String(base || '').replace(/\/$/, '')
+}
+
+function alternateLoopbackBase(base) {
+  if (!base) return ''
+  if (base.includes('://localhost')) return base.replace('://localhost', '://127.0.0.1')
+  if (base.includes('://127.0.0.1')) return base.replace('://127.0.0.1', '://localhost')
+  return ''
+}
+
+function deriveApiBaseCandidates() {
+  const fromWindow = typeof window !== 'undefined' && ['localhost', '127.0.0.1'].includes(window.location.hostname)
+    ? `${window.location.protocol}//${window.location.hostname}:3001`
+    : ''
+  const primary = normalizeBase(RAW_API_BASE || fromWindow || DEFAULT_API_BASE)
+  const alt = normalizeBase(alternateLoopbackBase(primary))
+  const fallbacks = ['http://127.0.0.1:3001', 'http://localhost:3001']
+  return [...new Set([primary, alt, ...fallbacks].filter(Boolean).map(normalizeBase))]
+}
+
+const API_BASE_CANDIDATES = deriveApiBaseCandidates()
 
 async function apiFetch(path, options = {}) {
   const { timeoutMs = 60_000, ...fetchOptions } = options
-  const controller = new AbortController()
-  const timeout = setTimeout(() => controller.abort(), timeoutMs)
   let response
-  try {
-    response = await fetch(`${API_BASE}${path}`, {
-      ...fetchOptions,
-      signal: fetchOptions.signal || controller.signal,
-      headers: {
-        'Content-Type': 'application/json',
-        ...(fetchOptions.headers || {}),
-      },
-    })
-  } catch (error) {
-    if (error?.name === 'AbortError') {
-      throw new Error('Tempo limite ao chamar a API local. Verifique se o backend/TTS esta respondendo.')
+
+  for (const apiBase of API_BASE_CANDIDATES) {
+    const controller = new AbortController()
+    const timeout = setTimeout(() => controller.abort(), timeoutMs)
+    try {
+      response = await fetch(`${apiBase}${path}`, {
+        ...fetchOptions,
+        signal: fetchOptions.signal || controller.signal,
+        headers: {
+          'Content-Type': 'application/json',
+          ...(fetchOptions.headers || {}),
+        },
+      })
+      break
+    } catch (error) {
+      if (error?.name === 'AbortError') {
+        throw new Error('Tempo limite ao chamar a API local. Verifique se o backend/TTS esta respondendo.')
+      }
+    } finally {
+      clearTimeout(timeout)
     }
-    throw new Error('Nao consegui conectar na API local. Rode `npm run api` e tente novamente.')
-  } finally {
-    clearTimeout(timeout)
+  }
+
+  if (!response) {
+    const tried = API_BASE_CANDIDATES.join(', ')
+    throw new Error(`Nao consegui conectar na API local (${tried}). Rode npm run api e tente novamente.`)
   }
 
   const raw = await response.text()
@@ -410,7 +528,10 @@ async function apiFetch(path, options = {}) {
     data = { message: raw || 'Resposta invalida da API.' }
   }
   if (!response.ok) {
-    throw new Error(data.message || data.error || 'Erro ao chamar API.')
+    const error = new Error(data.message || data.error || 'Erro ao chamar API.')
+    error.status = response.status
+    error.data = data
+    throw error
   }
   return data
 }

@@ -1,5 +1,6 @@
 import { WhatsAppInstanceService } from '../services.js'
 import { toast } from '../toast.js'
+import { rescoreLeads } from '../prospect.js'
 
 const API = import.meta.env.VITE_API_BASE || 'http://127.0.0.1:3001'
 
@@ -68,6 +69,10 @@ export function render() {
       <label>
         <span>Instancia WhatsApp</span>
         <select id="ap-instance"><option value="">Carregando...</option></select>
+      </label>
+      <label>
+        <span>Template de mensagem</span>
+        <select id="ap-template"><option value="">Carregando...</option></select>
       </label>
       <label>
         <span>Leads alvo</span>
@@ -213,6 +218,18 @@ export async function setup(root) {
   sendJobId = null
   if (pollTimer) clearInterval(pollTimer)
 
+  const templateSelect = root.querySelector('#ap-template')
+  try {
+    const templates = await fetch(`${API}/api/templates`).then(r => r.json())
+    const list = Array.isArray(templates) ? templates : []
+    templateSelect.innerHTML = list.length
+      ? `<option value="">Padrão (sem template)</option>` + list.map(t =>
+          `<option value="${escapeHtml(t.id)}">${escapeHtml(t.name)}</option>`).join('')
+      : '<option value="">Nenhum template cadastrado</option>'
+  } catch {
+    templateSelect.innerHTML = '<option value="">Erro ao carregar templates</option>'
+  }
+
   const instanceSelect = root.querySelector('#ap-instance')
   try {
     const instances = await WhatsAppInstanceService.list()
@@ -231,7 +248,11 @@ export async function setup(root) {
 
   root.querySelector('#ap-form').addEventListener('submit', event => submitPreview(event, root))
   root.querySelector('#ap-select-best').addEventListener('click', () => {
-    preview.leads.forEach(lead => { lead.selected = !lead.blocked && !lead.already_contacted && lead.whatsapp_status !== 'invalid' && lead.score >= 60 })
+    preview.leads.forEach(lead => {
+      const eligible = !lead.blocked && !lead.already_contacted && lead.whatsapp_status !== 'invalid'
+      // Seleciona se tem score alto OU prospect_score alto (PME ideal)
+      lead.selected = eligible && (lead.score >= 60 || (lead.prospect_score != null && lead.prospect_score >= 65))
+    })
     renderLeads(root)
   })
   root.querySelector('#ap-clear').addEventListener('click', () => {
@@ -253,6 +274,7 @@ async function submitPreview(event, root) {
     delay_max_s: Number(root.querySelector('#ap-delay-max').value || 90),
     ai_personalize: root.querySelector('#ap-ai').checked,
     validate_whatsapp: root.querySelector('#ap-wa').checked,
+    template_id: root.querySelector('#ap-template').value || null,
   }
   if (!payload.city) return toast('Informe a cidade.', 'error')
   if (!payload.instance_id) return toast('Selecione uma instancia conectada.', 'error')
@@ -271,6 +293,7 @@ async function submitPreview(event, root) {
     const data = await response.json()
     if (!response.ok) throw new Error(data.message || data.error || 'Erro ao gerar preview.')
     preview = data
+    if (Array.isArray(preview.leads)) preview.leads = rescoreLeads(preview.leads)
     preview.delay_min_s = payload.delay_min_s
     preview.delay_max_s = payload.delay_max_s
     root.querySelector('#ap-results').hidden = false
@@ -318,11 +341,21 @@ function renderLeads(root) {
 
 function leadCard(lead) {
   const waClass = lead.whatsapp_status === 'valid' ? 'good' : lead.whatsapp_status === 'invalid' ? 'bad' : 'warn'
-  const waText = lead.whatsapp_status === 'valid' ? 'WhatsApp ok' : lead.whatsapp_status === 'invalid' ? 'Sem WhatsApp' : 'WhatsApp incerto'
+  const waText  = lead.whatsapp_status === 'valid' ? 'WhatsApp ok' : lead.whatsapp_status === 'invalid' ? 'Sem WhatsApp' : 'WhatsApp incerto'
   const oldClass = lead.already_contacted ? 'bad' : 'good'
-  const oldText = lead.already_contacted ? 'Ja contatado' : 'Sem historico'
+  const oldText  = lead.already_contacted ? 'Ja contatado' : 'Sem historico'
   const scoreClass = lead.score >= 70 ? 'good' : lead.score >= 45 ? 'warn' : 'bad'
-  const disabled = lead.blocked || lead.already_contacted || lead.whatsapp_status === 'invalid'
+  const disabled   = lead.blocked || lead.already_contacted || lead.whatsapp_status === 'invalid'
+
+  const ps = lead.prospect_score ?? null
+  const psClass = ps == null ? '' : ps >= 65 ? 'good' : ps >= 40 ? 'warn' : 'bad'
+  const psLabel = ps == null ? '' : ps >= 65 ? `⭐ PME ${ps}` : ps >= 40 ? `PME ${ps}` : `Baixo ${ps}`
+
+  const sig = lead.prospect_signals || { pos: [], neg: [] }
+  const sigLines = [
+    ...(sig.pos || []).map(s => `<span style="color:var(--green-600);font-size:.72rem">✓ ${escapeHtml(s)}</span>`),
+    ...(sig.neg || []).map(s => `<span style="color:var(--red-500);font-size:.72rem">✗ ${escapeHtml(s)}</span>`),
+  ]
 
   return `
     <article class="lead-card ${disabled ? 'blocked' : ''}">
@@ -333,11 +366,13 @@ function leadCard(lead) {
         <h3>${escapeHtml(lead.name || 'Lead sem nome')}</h3>
         <div class="lead-meta">
           <span class="pill ${scoreClass}">Score ${lead.score}</span>
+          ${ps != null ? `<span class="pill ${psClass}" title="Potencial PME — quão provável é converter">${psLabel}</span>` : ''}
           <span class="pill ${waClass}">${waText}</span>
           <span class="pill ${oldClass}">${oldText}</span>
           <span class="pill">${escapeHtml(lead.intent || 'medio')}</span>
           <span class="pill">${escapeHtml((lead.sources || [lead.source]).filter(Boolean).join(' + ') || 'fonte')}</span>
         </div>
+        ${sigLines.length ? `<div style="display:flex;flex-direction:column;gap:1px;margin:4px 0">${sigLines.join('')}</div>` : ''}
         <div class="lead-detail">
           <div>${escapeHtml(lead.phone || '')} ${lead.address ? ' - ' + escapeHtml(lead.address) : ''}</div>
           ${lead.website ? `<div><a href="${escapeAttr(formatUrl(lead.website))}" target="_blank" rel="noreferrer">${escapeHtml(lead.website)}</a></div>` : ''}

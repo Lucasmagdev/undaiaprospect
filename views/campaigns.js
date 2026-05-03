@@ -78,9 +78,12 @@ async function loadTable(root) {
               <td class="camp-failed-cell">${c.failed_count ?? 0}</td>
               <td style="min-width:120px" class="camp-progress-cell">${progress(calcProgress(c))}</td>
               <td>
-                ${c.status === 'draft' || c.status === 'error' ? `<button class="primary run-btn" data-id="${c.id}" style="padding:5px 12px;font-size:12px">▶ Disparar</button>` : ''}
-                ${c.status === 'running' ? `<span class="muted" style="font-size:12px">Enviando...</span>` : ''}
-                ${c.status === 'finished' ? `<span class="muted" style="font-size:12px">Concluída</span>` : ''}
+                <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap">
+                  <button class="secondary detail-btn" data-id="${c.id}" style="padding:4px 10px;font-size:.78rem">Detalhes</button>
+                  ${c.status === 'draft' || c.status === 'error' ? `<button class="primary run-btn" data-id="${c.id}" style="padding:5px 12px;font-size:12px">▶ Disparar</button>` : ''}
+                  ${c.status === 'running' ? `<span class="muted" style="font-size:12px">Enviando...</span>` : ''}
+                  ${c.status === 'finished' ? `<span class="muted" style="font-size:12px">Concluída</span>` : ''}
+                </div>
               </td>
             </tr>
           `).join('')}
@@ -88,6 +91,12 @@ async function loadTable(root) {
       </table>
     </div>
   `
+
+  root.querySelectorAll('.detail-btn').forEach(btn => {
+    btn.addEventListener('click', () => {
+      window.__navigate?.('campaigns', { view: 'campaign-detail', params: { id: btn.dataset.id } })
+    })
+  })
 
   root.querySelectorAll('.run-btn').forEach(btn => {
     btn.addEventListener('click', () => runCampaign(btn.dataset.id, root))
