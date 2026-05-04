@@ -3288,6 +3288,69 @@ async function handleApi(req, res, url) {
     return sendJson(res, result.status, result.ok ? normalizeCampaignRecord(campaign) : campaign)
   }
 
+  const campaignDetailMatch = url.pathname.match(/^\/api\/campaigns\/([^/]+)$/)
+  if (campaignDetailMatch && req.method === 'GET') {
+    const campaignId = campaignDetailMatch[1]
+    let campaignRes = await supabaseRequest(`/campaigns?id=eq.${encodeURIComponent(campaignId)}&select=id,name,niche,city,neighborhood,use_audio,template_id,status,quantity_requested,daily_limit,sent_count,failed_count,delay_min_s,delay_max_s,started_at,finished_at,created_at&limit=1`)
+    if (!campaignRes.ok && isMissingColumn(campaignRes)) {
+      campaignRes = await supabaseRequest(`/campaigns?id=eq.${encodeURIComponent(campaignId)}&select=id,name,niche,city,template_id,status,quantity_requested,daily_limit,delay_min_seconds,delay_max_seconds,started_at,finished_at,created_at&limit=1`)
+    }
+    if (!campaignRes.ok) return sendJson(res, campaignRes.status, campaignRes.data)
+
+    const campaignRow = Array.isArray(campaignRes.data) ? campaignRes.data[0] : null
+    if (!campaignRow) return sendJson(res, 404, { message: 'Campanha nao encontrada.' })
+    const campaign = normalizeCampaignRecord(campaignRow)
+
+    const queueRes = await supabaseRequest(`/campaign_leads?campaign_id=eq.${encodeURIComponent(campaignId)}&select=id,lead_id,status,message_id,error,scheduled_at,sent_at,created_at&order=created_at.asc&limit=5000`)
+    const queueRows = queueRes.ok && Array.isArray(queueRes.data) ? queueRes.data : []
+
+    const leadIds = [...new Set(queueRows.map(row => row.lead_id).filter(Boolean))]
+    const leadsById = new Map()
+    if (leadIds.length) {
+      const leadsRes = await supabaseRequest(`/leads?id=in.(${leadIds.map(encodeURIComponent).join(',')})&select=id,name,phone,normalized_phone,niche,city,address,website,cnpj,email,source,status,last_interaction_at,created_at`)
+      if (leadsRes.ok && Array.isArray(leadsRes.data)) {
+        for (const lead of leadsRes.data) leadsById.set(lead.id, lead)
+      }
+    }
+
+    const messagesByLead = new Map()
+    const messagesRes = await supabaseRequest(`/messages?campaign_id=eq.${encodeURIComponent(campaignId)}&select=id,lead_id,body,status,error_message,sent_at,created_at&order=created_at.desc&limit=5000`)
+    if (messagesRes.ok && Array.isArray(messagesRes.data)) {
+      for (const message of messagesRes.data) {
+        if (message.lead_id && !messagesByLead.has(message.lead_id)) messagesByLead.set(message.lead_id, message)
+      }
+    }
+
+    const rows = queueRows.map(row => {
+      const lead = leadsById.get(row.lead_id) || {}
+      const message = messagesByLead.get(row.lead_id) || {}
+      return {
+        id: row.id,
+        lead_id: row.lead_id,
+        name: lead.name || 'Lead sem nome',
+        phone: lead.phone || lead.normalized_phone || '',
+        city: lead.city || campaign.city || '',
+        website: lead.website || '',
+        lead_status: lead.status || 'new',
+        campaign_lead_status: row.status || message.status || 'pending',
+        error: row.error || message.error_message || null,
+        sent_at: row.sent_at || message.sent_at || null,
+        last_message_body: message.body || '',
+        last_message_at: message.sent_at || message.created_at || row.sent_at || null,
+      }
+    })
+
+    const stats = {
+      total: rows.length,
+      sent: rows.filter(row => row.campaign_lead_status === 'sent').length,
+      failed: rows.filter(row => row.campaign_lead_status === 'failed').length,
+      responded: rows.filter(row => ['responded', 'qualified'].includes(row.lead_status)).length,
+      opt_out: rows.filter(row => row.lead_status === 'opt_out').length,
+    }
+
+    return sendJson(res, 200, { campaign, stats, leads: rows })
+  }
+
   if (url.pathname === '/api/leads' && req.method === 'GET') {
     const search = sanitizeLike(url.searchParams.get('search'))
     const hasWebsite = url.searchParams.get('hasWebsite')
