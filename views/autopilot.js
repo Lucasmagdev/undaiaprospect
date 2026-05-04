@@ -18,6 +18,17 @@ let preview = null
 let sendJobId = null
 let pollTimer = null
 
+async function readApiJson(response) {
+  const text = await response.text()
+  if (!text) return {}
+  try {
+    return JSON.parse(text)
+  } catch {
+    const plain = text.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim()
+    throw new Error(plain || `Resposta invalida do servidor (${response.status}).`)
+  }
+}
+
 function instanceName(instance) {
   return instance?.name ||
     instance?.instanceName ||
@@ -290,7 +301,7 @@ async function submitPreview(event, root) {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(payload),
     })
-    const data = await response.json()
+    const data = await readApiJson(response)
     if (!response.ok) throw new Error(data.message || data.error || 'Erro ao gerar preview.')
     preview = data
     if (Array.isArray(preview.leads)) preview.leads = rescoreLeads(preview.leads)
@@ -408,7 +419,7 @@ async function sendApproved(root) {
         daily_limit: approved.length,
       }),
     })
-    const data = await response.json()
+    const data = await readApiJson(response)
     if (!response.ok) throw new Error(data.message || data.error || 'Erro ao iniciar envio.')
     sendJobId = data.autopilot_id
     root.querySelector('#ap-progress').hidden = false
@@ -424,7 +435,7 @@ async function sendApproved(root) {
 async function pollSend(root) {
   if (!sendJobId) return
   const response = await fetch(`${API}/api/autopilot/${sendJobId}/status`)
-  const state = await response.json()
+  const state = await readApiJson(response)
   if (!response.ok) return
 
   root.querySelector('#ap-send-status').textContent = statusLabel(state.status)
